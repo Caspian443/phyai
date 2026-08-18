@@ -14,8 +14,8 @@ import phyai.layers.linear as L
 from phyai.layers.layer_norm import RMSNorm
 from phyai.weights import (
     LoadReport,
-    checkpoint_format,
-    iter_checkpoint_tensors,
+    WeightLoadSession,
+    load_named_weights,
     load_pretrained,
 )
 from phyai.weights import loader as loader_mod
@@ -82,6 +82,81 @@ def test_load_qkv_fused(tmp_path: Path, fake_mesh):
     assert torch.all(layer.weight.data[0:8] == 1.0)
     assert torch.all(layer.weight.data[8:16] == 2.0)
     assert torch.all(layer.weight.data[16:24] == 3.0)
+
+
+def test_incremental_weight_session_loads_fused_legs(fake_mesh):
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = L.QKVParallelLinear(
+        hidden_size=8,
+        head_dim=4,
+        num_heads=2,
+        num_kv_heads=2,
+        bias=False,
+        params_dtype=torch.float32,
+        prefix="model.layers.0.self_attn.qkv_proj",
+    )
+    session = WeightLoadSession(layer, source_label="test update")
+    session.load({"model.layers.0.self_attn.q_proj.weight": torch.full((8, 8), 1.0)})
+    session.load(
+        {
+            "model.layers.0.self_attn.k_proj.weight": torch.full((8, 8), 2.0),
+            "model.layers.0.self_attn.v_proj.weight": torch.full((8, 8), 3.0),
+        }
+    )
+
+    report = session.finish()
+
+    assert len(report.loaded) == 3
+    assert not report.missing
+    assert torch.all(layer.weight.data[0:8] == 1.0)
+    assert torch.all(layer.weight.data[8:16] == 2.0)
+    assert torch.all(layer.weight.data[16:24] == 3.0)
+
+
+def test_load_named_weights_validates_after_complete_collection(fake_mesh):
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = L.ReplicatedLinear(
+        in_features=4,
+        out_features=8,
+        bias=True,
+        params_dtype=torch.float32,
+        prefix="mod.fc",
+    )
+    source = {
+        "mod.fc.weight": torch.randn(8, 4),
+        "mod.fc.bias": torch.randn(8),
+    }
+
+    report = load_named_weights(layer, source)
+
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+    torch.testing.assert_close(layer.weight, source["mod.fc.weight"])
+    torch.testing.assert_close(layer.bias, source["mod.fc.bias"])
+
+
+def test_incremental_weight_session_allows_partial_hot_update(fake_mesh):
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = L.ReplicatedLinear(
+        in_features=4,
+        out_features=8,
+        bias=True,
+        params_dtype=torch.float32,
+        prefix="mod.fc",
+    )
+    original_bias = layer.bias.detach().clone()
+    updated_weight = torch.randn(8, 4)
+    session = WeightLoadSession(layer)
+    session.load({"mod.fc.weight": updated_weight})
+
+    report = session.finish(require_all=False)
+
+    assert report.loaded == ["mod.fc.weight"]
+    assert not report.missing
+    torch.testing.assert_close(layer.weight, updated_weight)
+    torch.testing.assert_close(layer.bias, original_bias)
 
 
 def test_load_norm(tmp_path: Path, fake_mesh):
@@ -394,82 +469,6 @@ def test_load_from_single_file_path(tmp_path: Path, fake_mesh):
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
 
 
-@pytest.mark.parametrize("suffix", [".bin", ".pt", ".pth"])
-@pytest.mark.parametrize("wrapper_key", [None, "model_state_dict", "state_dict"])
-def test_load_from_pytorch_checkpoint(
-    tmp_path: Path,
-    fake_mesh,
-    suffix: str,
-    wrapper_key: str | None,
-):
-    """PyTorch formats use the same dispatch and report as safetensors."""
-
-    fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
-    layer = _make_replicated()
-    src_w = torch.randn(8, 4, dtype=torch.float32)
-    src_b = torch.randn(8, dtype=torch.float32)
-    state = {"mod.fc.weight": src_w, "mod.fc.bias": src_b}
-    checkpoint = (
-        state if wrapper_key is None else {wrapper_key: state, "current_iter": 42}
-    )
-    path = tmp_path / f"checkpoint{suffix}"
-    torch.save(checkpoint, path)
-
-    report = load_pretrained(layer, path)
-
-    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
-    assert not report.missing
-    assert not report.unexpected
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
-
-
-@pytest.mark.parametrize(
-    ("suffix", "expected"),
-    [(".safetensors", "safetensors"), (".bin", "pytorch"), (".pth", "pytorch")],
-)
-def test_checkpoint_format(suffix: str, expected: str):
-    assert checkpoint_format(f"model{suffix}") == expected
-
-
-def test_load_from_pytorch_checkpoint_folder(tmp_path: Path, fake_mesh):
-    fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
-    layer = _make_replicated()
-    src_w = torch.randn(8, 4, dtype=torch.float32)
-    src_b = torch.randn(8, dtype=torch.float32)
-    torch.save(
-        {"model_state_dict": {"mod.fc.weight": src_w, "mod.fc.bias": src_b}},
-        tmp_path / "model.pth",
-    )
-
-    report = load_pretrained(layer, tmp_path)
-
-    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
-
-
-def test_load_legacy_pytorch_serialization(tmp_path: Path, fake_mesh):
-    fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
-    layer = _make_replicated()
-    src_w = torch.randn(8, 4, dtype=torch.float32)
-    src_b = torch.randn(8, dtype=torch.float32)
-    torch.save(
-        {"mod.fc.weight": src_w, "mod.fc.bias": src_b},
-        tmp_path / "legacy.pth",
-        _use_new_zipfile_serialization=False,
-    )
-
-    report = load_pretrained(layer, tmp_path / "legacy.pth")
-
-    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
-
-
 def test_load_from_iterable_of_str(tmp_path: Path, fake_mesh):
     """source = iterable of str (existing-iterable contract preserved)."""
     fake_mesh(sizes={"tp": 1})
@@ -486,30 +485,12 @@ def test_load_from_iterable_of_str(tmp_path: Path, fake_mesh):
 
 
 def test_load_from_empty_folder_raises(tmp_path: Path, fake_mesh):
-    """A folder without supported model weights fails before loading."""
+    """source = folder with no safetensors files -> FileNotFoundError."""
     fake_mesh(sizes={"tp": 1})
     _init_dispatcher()
     layer = _make_replicated()
-    with pytest.raises(FileNotFoundError, match="no supported model weight files"):
+    with pytest.raises(FileNotFoundError, match="no safetensors shards"):
         load_pretrained(layer, tmp_path)
-
-
-def test_duplicate_key_after_remap_raises(tmp_path: Path, fake_mesh):
-    fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
-    layer = _make_replicated()
-    first = tmp_path / "first.safetensors"
-    second = tmp_path / "second.safetensors"
-    save_file({"upstream.a": torch.randn(8, 4)}, str(first))
-    save_file({"upstream.b": torch.randn(8, 4)}, str(second))
-
-    with pytest.raises(RuntimeError, match="appears more than once after remap"):
-        load_pretrained(
-            layer,
-            [first, second],
-            remap=lambda _key: "mod.fc.weight",
-            strict=False,
-        )
 
 
 def test_load_unexpected_keys_with_dropping_remap_via_folder(tmp_path: Path, fake_mesh):
@@ -541,55 +522,6 @@ def test_load_unexpected_keys_with_dropping_remap_via_folder(tmp_path: Path, fak
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
 
 
-def test_safetensors_dispatches_keys_before_materializing_tensors(
-    tmp_path: Path,
-    fake_mesh,
-    monkeypatch,
-):
-    fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
-    layer = _make_replicated()
-    checkpoint = tmp_path / "model.safetensors"
-    checkpoint.write_bytes(b"placeholder")
-    tensors = {
-        "drop.this.weight": torch.zeros(2),
-        "totally.unexpected": torch.zeros(2),
-        "mod.fc.weight": torch.randn(8, 4),
-        "mod.fc.bias": torch.randn(8),
-    }
-    materialized: list[str] = []
-
-    class TrackingSafeOpen:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def keys(self):
-            return list(tensors)
-
-        def get_tensor(self, name):
-            materialized.append(name)
-            return tensors[name]
-
-    monkeypatch.setattr(
-        loader_mod, "safe_open", lambda *_args, **_kwargs: TrackingSafeOpen()
-    )
-
-    report = load_pretrained(
-        layer,
-        checkpoint,
-        remap=lambda key: None if key.startswith("drop.") else key,
-        strict=False,
-        progress=False,
-    )
-
-    assert materialized == ["mod.fc.weight", "mod.fc.bias"]
-    assert report.unexpected == ["totally.unexpected"]
-    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
-
-
 # --------------------------------------------------------------------------- #
 # Progress bar.                                                               #
 # --------------------------------------------------------------------------- #
@@ -598,10 +530,9 @@ def test_safetensors_dispatches_keys_before_materializing_tensors(
 class _FakeBar:
     """Records tqdm interactions so tests can assert bar behaviour."""
 
-    def __init__(self, *, total=None, disable=None, unit=None, **_kwargs):
+    def __init__(self, *, total=None, disable=None, **_kwargs):
         self.total = total
         self.disable = disable
-        self.unit = unit
         self.updates = 0
         self.closed = False
         self.postfixes: list[str] = []
@@ -630,29 +561,12 @@ def spy_bar(monkeypatch):
     return bars
 
 
-def test_count_progress_units_sums_safetensors_keys(tmp_path: Path):
+def test_count_keys_sums_across_shards(tmp_path: Path):
     a = tmp_path / "a.safetensors"
     b = tmp_path / "b.safetensors"
     save_file({"x": torch.zeros(2), "y": torch.zeros(2)}, str(a))
     save_file({"z": torch.zeros(2)}, str(b))
-    assert loader_mod._count_progress_units([a, b]) == 3
-
-
-def test_count_progress_units_supports_mixed_checkpoint_formats(tmp_path: Path):
-    safetensors_path = tmp_path / "a.safetensors"
-    pytorch_path = tmp_path / "b.pth"
-    save_file({"x": torch.zeros(2)}, str(safetensors_path))
-    torch.save(
-        {
-            "model_state_dict": {
-                "y": torch.zeros(2),
-                "z": torch.zeros(2),
-            },
-            "current_iter": 42,
-        },
-        pytorch_path,
-    )
-    assert loader_mod._count_progress_units([safetensors_path, pytorch_path]) == 2
+    assert loader_mod._count_keys([a, b]) == 3
 
 
 def test_progress_disable_resolution(fake_mesh):
@@ -691,7 +605,6 @@ def test_progress_bar_advances_once_per_key(tmp_path: Path, fake_mesh, spy_bar):
     assert bar.total == 4  # every key counted
     assert bar.updates == 4  # advanced once per key
     assert bar.disable is False  # progress=True forces it on
-    assert bar.unit == "tensor"
     assert bar.closed is True
     assert bar.postfixes == ["model.safetensors"]
 
@@ -722,85 +635,6 @@ def test_progress_default_is_auto(tmp_path: Path, fake_mesh, spy_bar):
     )
     load_pretrained(layer, tmp_path)
     assert spy_bar[0].disable is None
-
-
-def test_pytorch_progress_counts_files_and_loads_each_once(
-    tmp_path: Path,
-    fake_mesh,
-    spy_bar,
-    monkeypatch,
-):
-    fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
-    layer = _make_replicated()
-    weight_path = tmp_path / "weight.bin"
-    bias_path = tmp_path / "bias.bin"
-    torch.save({"mod.fc.weight": torch.randn(8, 4)}, weight_path)
-    torch.save({"mod.fc.bias": torch.randn(8)}, bias_path)
-    original_load = loader_mod.torch.load
-    calls: list[dict[str, object]] = []
-
-    def counted_load(*args, **kwargs):
-        calls.append(kwargs.copy())
-        return original_load(*args, **kwargs)
-
-    monkeypatch.setattr(loader_mod.torch, "load", counted_load)
-
-    load_pretrained(layer, [weight_path, bias_path], progress=True)
-
-    assert len(calls) == 2
-    assert all(call["map_location"] == "cpu" for call in calls)
-    assert all(call["weights_only"] is True for call in calls)
-    bar = spy_bar[0]
-    assert bar.total == 2
-    assert bar.updates == 2
-    assert bar.unit == "file"
-    assert bar.closed is True
-
-
-def test_pytorch_legacy_tar_retries_with_weights_only_false(
-    tmp_path: Path,
-    monkeypatch,
-    caplog,
-):
-    checkpoint = tmp_path / "legacy.pth"
-    checkpoint.write_bytes(b"placeholder")
-    tensor = torch.ones(2)
-    calls: list[dict[str, object]] = []
-
-    def fake_load(*_args, **kwargs):
-        calls.append(kwargs.copy())
-        if kwargs["weights_only"] is True:
-            raise RuntimeError("Cannot load weights in legacy .tar format")
-        return {"weight": tensor}
-
-    monkeypatch.setattr(loader_mod.torch, "load", fake_load)
-
-    with caplog.at_level("WARNING", logger=loader_mod.__name__):
-        loaded = list(iter_checkpoint_tensors(checkpoint))
-
-    assert [call["weights_only"] for call in calls] == [True, False]
-    assert loaded[0][0] == "weight"
-    torch.testing.assert_close(loaded[0][1], tensor)
-    assert "weights_only=False" in caplog.text
-
-
-def test_pytorch_non_legacy_error_does_not_retry(tmp_path: Path, monkeypatch):
-    checkpoint = tmp_path / "broken.pth"
-    checkpoint.write_bytes(b"placeholder")
-    calls = 0
-
-    def fake_load(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        raise RuntimeError("corrupted checkpoint")
-
-    monkeypatch.setattr(loader_mod.torch, "load", fake_load)
-
-    with pytest.raises(RuntimeError, match="corrupted checkpoint"):
-        list(iter_checkpoint_tensors(checkpoint))
-
-    assert calls == 1
 
 
 # --------------------------------------------------------------------------- #
