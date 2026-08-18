@@ -30,9 +30,10 @@ a second source of truth.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, ClassVar
+from typing import ClassVar
 
 import torch
 
@@ -46,8 +47,7 @@ from phyai.models.pi05.scheduler_ws1_pi05 import (
     PI05WS1Scheduler,
 )
 from phyai.utils import load_config, this_rank_log
-from phyai.weights import load_pretrained
-
+from phyai.weights import LoadReport, WeightLoadSession, load_pretrained
 
 logger = logging.getLogger(__name__)
 
@@ -154,10 +154,13 @@ class PI05Entry(Entry):
         # check for "setup not yet run" without an attr-exists guard.
         self.model: PI05Model | None = None
         self.scheduler: PI05WS1Scheduler | None = None
+        self.weight_remap: Callable[[str], str | None] | dict[str, str] | None = None
+        self.weight_update: WeightLoadSession | None = None
 
     def setup(self, args: PI05Args) -> None:  # type: ignore[override]
         """Build model, load weights, construct + warm the scheduler."""
         eng = get_engine_config()
+        self.weight_remap = args.weight_remap
 
         # Resolve config: explicit override > checkpoint folder > defaults.
         if args.config is not None:
@@ -303,7 +306,56 @@ class PI05Entry(Entry):
             )
         return self.scheduler.step(request)
 
+    def begin_weight_update(self) -> None:
+        """Start one incremental HF-named weight update."""
+        if self.model is None:
+            raise RuntimeError("PI05Entry weight update requires a loaded model.")
+        if self.weight_update is not None:
+            raise RuntimeError("A PI05Entry weight update is already active.")
+        self.weight_update = WeightLoadSession(
+            self.model,
+            remap=_compose_remap(self.weight_remap),
+            source_label="hot update",
+        )
+
+    def update_weights(
+        self,
+        weights: Mapping[str, torch.Tensor] | Iterable[tuple[str, torch.Tensor]],
+    ) -> None:
+        """Apply one streamed named-tensor batch to the active session."""
+        if self.weight_update is None:
+            raise RuntimeError("begin_weight_update() must be called first.")
+        self.weight_update.load(weights)
+
+    def finish_weight_update(self) -> LoadReport:
+        """Validate the update and refresh scheduler constants in place."""
+        if self.weight_update is None:
+            raise RuntimeError("No PI05Entry weight update is active.")
+        if self.scheduler is None:
+            raise RuntimeError("PI05Entry weight update requires a scheduler.")
+        if not self.weight_update.report.loaded:
+            raise RuntimeError(
+                "PI05Entry hot update did not match any PhyAI model weights."
+            )
+        report = self.weight_update.finish(strict=False, require_all=False)
+        if report.unexpected:
+            this_rank_log(
+                logger,
+                logging.WARNING,
+                "pi0.5 hot update skipped %d actor-only or unknown tensors: %s",
+                len(report.unexpected),
+                report.unexpected[:5],
+            )
+        self.scheduler.refresh_weight_dependent_state()
+        self.weight_update = None
+        return report
+
+    def abort_weight_update(self) -> None:
+        """Discard bookkeeping for a failed streamed update."""
+        self.weight_update = None
+
     def close(self) -> None:
+        self.weight_update = None
         if self.scheduler is not None:
             self.scheduler.close()
             self.scheduler = None
