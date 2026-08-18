@@ -367,21 +367,7 @@ class PI05WS1Scheduler(Scheduler):
         self.vision_runner.setup()
         self.llm_runner.setup(self._n_per_sample_buckets)
 
-        # Precompute the time-embedding table for the linear flow-matching
-        # schedule ``t = 1.0 + step * (-1/N)``. ``embed_time`` is the full
-        # MLP (sinusoidal -> Linear -> SiLU -> Linear -> SiLU); its output
-        # depends only on the time scalar and the time-MLP weights, both
-        # fixed across inferences, so a one-time precompute keeps those
-        # matmuls out of the captured Euler loop.
-        N = self.cfg.num_inference_steps
-        ts = 1.0 + torch.arange(N, dtype=torch.float32, device=self.device) * (-1.0 / N)
-        with torch.no_grad():
-            self.time_emb_table = self.model.heads.embed_time(ts).contiguous()
-        # Bind the schedule before the expert runner captures: its graph
-        # unrolls all N steps and reads ``time_emb_table[step]`` in-graph.
-        self.expert_runner.bind_euler_schedule(
-            self.time_emb_table, dt=-1.0 / N, num_steps=N
-        )
+        self.refresh_weight_dependent_state()
 
         # Suffix write indices are constant — bind them once, sized for
         # max_batch_size. Sample ``b``'s chunk_size tokens write to
@@ -400,6 +386,35 @@ class PI05WS1Scheduler(Scheduler):
         # Capture the expert graph last — the schedule + write indices it
         # reads in-graph must already be bound above.
         self.expert_runner.setup()
+
+    @torch.no_grad()
+    def refresh_weight_dependent_state(self) -> None:
+        """Refresh constants derived from model weights after a hot update.
+
+        The time embedding and AdaRMS modulation tables depend on trainable
+        parameters but live outside the model state dict. Same-shape refreshes
+        preserve their existing storage so captured CUDA graphs remain valid.
+        """
+        num_steps = self.cfg.num_inference_steps
+        times = 1.0 + torch.arange(
+            num_steps, dtype=torch.float32, device=self.device
+        ) * (-1.0 / num_steps)
+        updated_time_embeddings = self.model.heads.embed_time(times).contiguous()
+        if (
+            self.time_emb_table is not None
+            and self.time_emb_table.shape == updated_time_embeddings.shape
+            and self.time_emb_table.dtype == updated_time_embeddings.dtype
+            and self.time_emb_table.device == updated_time_embeddings.device
+        ):
+            self.time_emb_table.copy_(updated_time_embeddings)
+        else:
+            self.time_emb_table = updated_time_embeddings
+
+        self.expert_runner.bind_euler_schedule(
+            self.time_emb_table,
+            dt=-1.0 / num_steps,
+            num_steps=num_steps,
+        )
 
     # ------------------------------------------------------------------ #
     # Step (one inference)                                               #
