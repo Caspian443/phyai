@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar
@@ -117,6 +118,17 @@ class Entry(abc.ABC):
     @abc.abstractmethod
     def step(self, request: Any) -> Any:
         """Run one inference round. Request / response shape is plugin-defined."""
+
+    def rollout_step(self, request: Any, **kwargs: Any) -> Any:
+        """Run an opt-in training rollout round.
+
+        Plugins may expose structured behavior-policy state here without changing
+        the return type of :meth:`step` for existing inference callers.
+        """
+        del request, kwargs
+        raise NotImplementedError(
+            f"Plugin {self.name!r} does not support training rollout output."
+        )
 
     def close(self) -> None:
         """Release pinned GPU resources. Default: no-op."""
@@ -298,6 +310,11 @@ class Engine:
         self.args = args
         self.entry: Entry = entry_cls()
         self.entry.setup(args.plugin_args)
+        self._model_lock = threading.Lock()
+        self._weight_update_active = False
+        self._weight_update_received = False
+        self._weight_update_failed = False
+        self._version = 0
 
         if self._dump_enabled:
             self._dumper = self._build_dumper()
@@ -329,31 +346,91 @@ class Engine:
         return runtime.debug_tensor_dump_filter
 
     def step(self, request: Any) -> Any:
-        result = self.entry.step(request)
-        if self._dumper is not None:
-            self._dumper.flush_pass()
-        return result
+        with self._model_lock:
+            self._require_usable()
+            result = self.entry.step(request)
+            if self._dumper is not None:
+                self._dumper.flush_pass()
+            return result
+
+    def rollout_step(self, request: Any, **kwargs: Any) -> Any:
+        """Return plugin-specific training state without changing ``step``."""
+        with self._model_lock:
+            self._require_usable()
+            result = self.entry.rollout_step(request, **kwargs)
+            if self._dumper is not None:
+                self._dumper.flush_pass()
+            return result
+
+    @property
+    def version(self) -> int:
+        """Last fully committed in-memory weight version."""
+        return self._version
+
+    def _require_usable(self) -> None:
+        if self._weight_update_failed:
+            raise RuntimeError(
+                "Engine is unavailable after a partially applied weight update; "
+                "recreate it before further inference."
+            )
 
     def begin_weight_update(self) -> None:
         """Begin one streamed hot update on the active plugin."""
-        self.entry.begin_weight_update()
+        self._model_lock.acquire()
+        try:
+            self._require_usable()
+            if self._weight_update_active:
+                raise RuntimeError("A weight update is already active.")
+            self.entry.begin_weight_update()
+            self._weight_update_active = True
+            self._weight_update_received = False
+        except Exception:
+            self._model_lock.release()
+            raise
 
     def update_weights(
         self,
         weights: Mapping[str, torch.Tensor] | Iterable[tuple[str, torch.Tensor]],
     ) -> None:
         """Forward one named-tensor batch to the active plugin."""
+        if not self._weight_update_active:
+            raise RuntimeError("begin_weight_update() must be called first.")
         self.entry.update_weights(weights)
+        self._weight_update_received = True
 
-    def finish_weight_update(self) -> Any:
-        """Finalize the active plugin update and return its load report."""
-        return self.entry.finish_weight_update()
+    def finish_weight_update(self, version: int | None = None) -> Any:
+        """Finalize an update and commit its version only after validation."""
+        if not self._weight_update_active:
+            raise RuntimeError("No weight update is active.")
+        try:
+            report = self.entry.finish_weight_update()
+            self._version = self._version + 1 if version is None else int(version)
+            return report
+        except Exception:
+            if self._weight_update_received:
+                self._weight_update_failed = True
+            raise
+        finally:
+            self._weight_update_active = False
+            self._weight_update_received = False
+            self._model_lock.release()
 
     def abort_weight_update(self) -> None:
         """Abort bookkeeping for the active plugin update."""
-        self.entry.abort_weight_update()
+        if not self._weight_update_active:
+            return
+        try:
+            self.entry.abort_weight_update()
+            if self._weight_update_received:
+                self._weight_update_failed = True
+        finally:
+            self._weight_update_active = False
+            self._weight_update_received = False
+            self._model_lock.release()
 
     def close(self) -> None:
+        if self._weight_update_active:
+            self.abort_weight_update()
         if self._dumper is not None:
             self._dumper.detach()
             self._dumper = None

@@ -672,3 +672,17 @@ def test_load_pretrained_repo_id_forwarded(tmp_path: Path, fake_mesh, monkeypatc
     assert seen["repo_id"] == "org/model"
     assert seen["revision"] == "v1"
     torch.testing.assert_close(layer.weight.data, src_w)
+
+
+def test_pi05_drop_key_is_applied_after_actor_prefix_remap():
+    from phyai.models.pi05.main_pi05 import _compose_remap
+
+    remap = _compose_remap(lambda name: name.removeprefix("model."))
+
+    dropped = (
+        "model.paligemma_with_expert.gemma_expert.lm_head.weight",
+        ("model.paligemma_with_expert.paligemma.model.language_model."
+        "embed_tokens.weight"),
+    )
+    assert all(remap(name) is None for name in dropped)
+    assert remap("model.action_in_proj.weight") == "action_in_proj.weight"

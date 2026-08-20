@@ -44,6 +44,8 @@ from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_ws1_pi05 import (
     PI05Request,
+    PI05RolloutConfig,
+    PI05RolloutResult,
     PI05WS1Scheduler,
 )
 from phyai.utils import load_config, this_rank_log
@@ -55,10 +57,16 @@ logger = logging.getLogger(__name__)
 # Keys present in the upstream pi0.5 base safetensors that the inference
 # model never consumes. The expert was trained with a lm_head sibling to
 # the language model's, but at inference the expert produces flow-matching
-# vectors (not tokens), so its lm_head weight has no parameter to land in.
+# vectors (not tokens), so its lm_head weight has no parameter to land in. The
+# native Actor state dict also exposes its tied PaliGemma embedding a second
+# time through model.language_model.embed_tokens; the canonical lm_head alias
+# already loads that same target.
 # Dropping it silently keeps `weight_strict=True` honest for everything else.
 _PI05_DROP_KEYS: frozenset[str] = frozenset(
-    {"paligemma_with_expert.gemma_expert.lm_head.weight"}
+    {
+        "paligemma_with_expert.gemma_expert.lm_head.weight",
+        "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
+    }
 )
 
 
@@ -67,8 +75,9 @@ def _compose_remap(
 ) -> Callable[[str], str | None]:
     """Combine the pi0.5-specific drop set with the caller's remap.
 
-    The drop set runs first; any key it returns ``None`` for is removed
-    before the user remap sees it.
+    The drop set is checked both before and after the user remap. This handles
+    Actor wrappers that first remove a namespace such as ``model.`` before the
+    resulting upstream HF key can be recognized as inference-only.
     """
     if user_remap is None:
         return lambda k: None if k in _PI05_DROP_KEYS else k
@@ -77,7 +86,8 @@ def _compose_remap(
         def _chained(k: str) -> str | None:
             if k in _PI05_DROP_KEYS:
                 return None
-            return user_remap(k)
+            remapped = user_remap(k)
+            return None if remapped in _PI05_DROP_KEYS else remapped
 
         return _chained
     if isinstance(user_remap, dict):
@@ -89,7 +99,7 @@ def _compose_remap(
             for src, dst in rules:
                 if src in k:
                     k = k.replace(src, dst)
-            return k
+            return None if k in _PI05_DROP_KEYS else k
 
         return _chained_dict
     raise TypeError(
@@ -140,6 +150,8 @@ class PI05Args(EntryArgs):
     weight_strict: bool = True
     vision_params_dtype: torch.dtype | None = None
     inputs_image_shape: list[list[int]] | None = None
+    add_value_head: bool = False
+    require_full_hot_update: bool = False
 
 
 @Engine.register
@@ -156,11 +168,13 @@ class PI05Entry(Entry):
         self.scheduler: PI05WS1Scheduler | None = None
         self.weight_remap: Callable[[str], str | None] | dict[str, str] | None = None
         self.weight_update: WeightLoadSession | None = None
+        self.require_full_hot_update = False
 
     def setup(self, args: PI05Args) -> None:  # type: ignore[override]
         """Build model, load weights, construct + warm the scheduler."""
         eng = get_engine_config()
         self.weight_remap = args.weight_remap
+        self.require_full_hot_update = args.require_full_hot_update
 
         # Resolve config: explicit override > checkpoint folder > defaults.
         if args.config is not None:
@@ -182,6 +196,7 @@ class PI05Entry(Entry):
             self.model = PI05Model(
                 config,
                 vision_params_dtype=args.vision_params_dtype,
+                add_value_head=args.add_value_head,
                 device=eng.device.target,
             )
 
@@ -192,6 +207,9 @@ class PI05Entry(Entry):
                 remap=_compose_remap(args.weight_remap),
                 strict=args.weight_strict,
             )
+
+        if self.model.value_head is not None:
+            self.model.value_head.require_hot_update_weights()
 
         num_images = self._resolve_num_images(args.inputs_image_shape, config)
 
@@ -306,6 +324,16 @@ class PI05Entry(Entry):
             )
         return self.scheduler.step(request)
 
+    def rollout_step(
+        self, request: PI05Request, rollout_config: PI05RolloutConfig
+    ) -> PI05RolloutResult:
+        """Run the opt-in training rollout path without changing step()."""
+        if self.scheduler is None:
+            raise RuntimeError(
+                "PI05Entry.rollout_step called before setup; the scheduler is None."
+            )
+        return self.scheduler.rollout_step(request, rollout_config)
+
     def begin_weight_update(self) -> None:
         """Start one incremental HF-named weight update."""
         if self.model is None:
@@ -337,7 +365,10 @@ class PI05Entry(Entry):
             raise RuntimeError(
                 "PI05Entry hot update did not match any PhyAI model weights."
             )
-        report = self.weight_update.finish(strict=False, require_all=False)
+        report = self.weight_update.finish(
+            strict=self.require_full_hot_update,
+            require_all=self.require_full_hot_update,
+        )
         if report.unexpected:
             this_rank_log(
                 logger,

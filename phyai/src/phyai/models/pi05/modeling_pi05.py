@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
+from itertools import pairwise
 
 import torch
 import torch.nn as nn
@@ -1042,6 +1043,48 @@ class ActionTimeHeads(nn.Module):
         return F.silu(h)
 
 
+class PI05ValueHead(nn.Module):
+    """RLinf-compatible prefix value head used only for training rollouts."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        device: torch.device | str | None,
+    ) -> None:
+        super().__init__()
+        widths = (input_dim, 1024, 512, 256, 1)
+        self.layers = nn.ModuleList()
+        for index, (in_features, out_features) in enumerate(
+            pairwise(widths)
+        ):
+            linear = ReplicatedLinear(
+                in_features,
+                out_features,
+                bias=True,
+                params_dtype=params_dtype,
+                device=device,
+                prefix=f"value_head.mlp.{index * 2}",
+            )
+            for parameter in linear.parameters():
+                parameter.optional = True
+            self.layers.append(linear)
+
+    def require_hot_update_weights(self) -> None:
+        """Make value tensors mandatory after checkpoint initialization."""
+        for parameter in self.parameters():
+            parameter.optional = False
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x = hidden_states
+        for index, linear in enumerate(self.layers):
+            x, _ = linear(x)
+            if index + 1 < len(self.layers):
+                x = F.relu(x)
+        return x
+
+
 class PI05Model(nn.Module):
     """Full pi0.5 inference model — flat composition of forward-able sub-modules.
 
@@ -1065,6 +1108,7 @@ class PI05Model(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         vision_params_dtype: torch.dtype | None = None,
+        add_value_head: bool = False,
         attn_backend: str | None = None,
         norm_backend: str | None = None,
         rope_backend: str | None = None,
@@ -1183,6 +1227,15 @@ class PI05Model(nn.Module):
             config,
             params_dtype=params_dtype,
         )
+        self.value_head = (
+            PI05ValueHead(
+                config.text.hidden_size,
+                params_dtype=params_dtype,
+                device=device,
+            )
+            if add_value_head
+            else None
+        )
 
 
 __all__ = [
@@ -1199,6 +1252,7 @@ __all__ = [
     "PI05ExpertLayer",
     "PI05ExpertStack",
     "PI05Model",
+    "PI05ValueHead",
     "PI05VisionTower",
     "PositionEmbedding",
     "SIGLIP_NORM_HF_NAMES",

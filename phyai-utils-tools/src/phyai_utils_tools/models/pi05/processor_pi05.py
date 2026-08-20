@@ -45,6 +45,7 @@ from phyai_utils_tools.processing.transition import (
     INPUT_IDS,
     LANG_LENS,
     PIXEL_VALUES,
+    STATE,
     Transition,
 )
 from phyai_utils_tools.tokenizer import get_tokenizer
@@ -78,6 +79,7 @@ class PI05ProcessedInputs:
     pixel_values: torch.Tensor  # (B, num_images, C, image_size, image_size)
     input_ids: torch.Tensor  # (B, tokenizer_max_length) int64
     lang_lens: torch.Tensor  # (B,) int64
+    state: torch.Tensor | None = None  # normalized state, when supplied
 
 
 def _features_for_stats(
@@ -121,6 +123,7 @@ class PI05Processor(BaseModelProcessor):
         dataset_stats: dict[str, dict[str, Any]] | None = None,
         normalize_pixels: bool = False,
         image_pad_value: float = 0.0,
+        include_state_in_prompt: bool = True,
         device: torch.device | str = "cpu",
         params_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
@@ -133,6 +136,7 @@ class PI05Processor(BaseModelProcessor):
         self.dataset_stats = dataset_stats
         self.normalize_pixels = bool(normalize_pixels)
         self.image_pad_value = float(image_pad_value)
+        self.include_state_in_prompt = bool(include_state_in_prompt)
         self.device = device
         self.params_dtype = params_dtype
         self.tokenizer = (
@@ -149,6 +153,7 @@ class PI05Processor(BaseModelProcessor):
             pixel_values=transition[PIXEL_VALUES],
             input_ids=transition[INPUT_IDS],
             lang_lens=transition[LANG_LENS],
+            state=transition.get(STATE),
         )
 
     @staticmethod
@@ -185,7 +190,9 @@ class PI05Processor(BaseModelProcessor):
                 stats=self.dataset_stats,
                 device=self.device,
             ),
-            StateTokenizerPrepareStep(),
+            StateTokenizerPrepareStep(
+                include_state_in_prompt=self.include_state_in_prompt
+            ),
             TokenizerStep(
                 tokenizer=self.tokenizer,
                 max_length=self.tokenizer_max_length,
@@ -232,6 +239,7 @@ class PI05Processor(BaseModelProcessor):
         action_dim: int | None = None,
         normalize_pixels: bool = False,
         image_pad_value: float = 0.0,
+        include_state_in_prompt: bool = True,
         device: torch.device | str = "cpu",
         params_dtype: torch.dtype = torch.bfloat16,
         **hub_kwargs: Any,
@@ -288,9 +296,14 @@ class PI05Processor(BaseModelProcessor):
         obj.dataset_stats = None
         obj.normalize_pixels = bool(normalize_pixels)
         obj.image_pad_value = float(image_pad_value)
+        obj.include_state_in_prompt = bool(include_state_in_prompt)
         obj.device = device
         obj.params_dtype = params_dtype
         obj.tokenizer = tok
+
+        for step in pre.steps:
+            if isinstance(step, StateTokenizerPrepareStep):
+                step.include_state_in_prompt = obj.include_state_in_prompt
 
         # Prepend phyai vision glue to the loaded preprocess chain.
         pre.steps = [*obj._vision_steps(), *list(pre.steps)]

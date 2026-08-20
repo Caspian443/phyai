@@ -44,6 +44,7 @@ class StateTokenizerPrepareStep(ProcessorStep):
 
     num_bins: int = STATE_NUM_BINS
     max_state_dim: int = 32
+    include_state_in_prompt: bool = True
 
     def __call__(self, transition: Transition) -> Transition:
         tasks = transition.get(TASK)
@@ -54,12 +55,12 @@ class StateTokenizerPrepareStep(ProcessorStep):
 
         out = transition.copy()
         state = transition.get(STATE)
-        if state is not None:
+        if state is not None and self.include_state_in_prompt:
             discretized = discretize_state(state, num_bins=self.num_bins)
             out[PROMPT] = build_prompts(list(tasks), discretized)
         else:
             out[PROMPT] = [
-                f"Task: {t.strip().replace('_', ' ').replace(chr(10), ' ')};\nAction: "
+                f"{t.strip().replace('_', ' ').replace(chr(10), ' ')}\n"
                 for t in tasks
             ]
         return out

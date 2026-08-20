@@ -7,10 +7,10 @@ tokenizer call is the only stub.
 
 from __future__ import annotations
 
-import torch
-
 import phyai_utils_tools.models.pi05.processor_pi05 as proc_mod
+import torch
 from phyai_utils_tools.models.pi05 import PI05ProcessedInputs, PI05Processor
+from phyai_utils_tools.models.pi05.steps_pi05 import StateTokenizerPrepareStep
 
 
 class _StubTokenizer:
@@ -118,3 +118,16 @@ def test_save_then_from_pretrained_roundtrip(monkeypatch, tmp_path):
     # postprocess still trims to action_dim
     act = loaded.postprocess(torch.rand(b, 50, 32))
     assert act.shape == (b, 50, 7)
+
+
+def test_task_only_prompt_matches_native_openpi():
+    step = StateTokenizerPrepareStep(include_state_in_prompt=False)
+
+    result = step(
+        {
+            "task": ["pick_up the cup", "put\nthe bowl down"],
+            "state": torch.zeros(2, 8),
+        }
+    )
+
+    assert result["prompt"] == ["pick up the cup\n", "put the bowl down\n"]

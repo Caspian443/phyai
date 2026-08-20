@@ -199,7 +199,14 @@ class _NormalizeBase(ProcessorStep):
             stats = self._tensor_stats.get(name)
             if not stats:
                 continue
-            out[field_name] = fn(out[field_name], mode, stats, self.eps)
+            value = out[field_name]
+            value_stats = {
+                stat: tensor.to(device=value.device, dtype=value.dtype)
+                if tensor.device != value.device or tensor.dtype != value.dtype
+                else tensor
+                for stat, tensor in stats.items()
+            }
+            out[field_name] = fn(value, mode, value_stats, self.eps)
         return out
 
 

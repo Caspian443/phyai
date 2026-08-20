@@ -30,6 +30,8 @@ batching, preemption, and tensor parallel are out of scope here.
 
 from __future__ import annotations
 
+import math
+import random
 from dataclasses import dataclass
 
 import torch
@@ -188,6 +190,78 @@ class PI05Request:
     input_ids: torch.Tensor
     lang_lens: torch.Tensor
     noise: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class PI05RolloutConfig:
+    """Behavior-policy sampling knobs matching RLinf's native pi0.5 PPO path."""
+
+    action_chunk: int
+    action_dim: int
+    noise_method: str = "flow_sde"
+    noise_level: float = 0.5
+    denoise_index: int | None = None
+
+
+@dataclass
+class PI05RolloutResult:
+    """Structured rollout state consumed by RLinf Actor replay."""
+
+    actions: torch.Tensor
+    chains: torch.Tensor
+    denoise_inds: torch.Tensor
+    prev_logprobs: torch.Tensor
+    prev_values: torch.Tensor
+
+
+def _gaussian_logprob(
+    sample: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
+) -> torch.Tensor:
+    mask = std == 0
+    safe_std = torch.where(mask, torch.ones_like(std), std)
+    result = (
+        -torch.log(safe_std)
+        - 0.5 * math.log(2.0 * math.pi)
+        - 0.5 * ((sample - mean) / safe_std) ** 2
+    )
+    return torch.where(mask, torch.zeros_like(result), result)
+
+
+def _sample_mean_var(
+    x_t: torch.Tensor,
+    velocity: torch.Tensor,
+    step: int,
+    *,
+    method: str,
+    noise_level: float,
+    num_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match RLinf's native OpenPI flow ODE/SDE transition."""
+    timesteps = torch.linspace(
+        1.0, 1.0 / num_steps, num_steps, device=x_t.device, dtype=x_t.dtype
+    )
+    timesteps = torch.cat([timesteps, torch.zeros(1, device=x_t.device)])
+    t_input = timesteps[step]
+    delta = timesteps[step] - timesteps[step + 1]
+    x0_pred = x_t - velocity * t_input
+    x1_pred = x_t + velocity * (1 - t_input)
+
+    if method == "flow_ode":
+        x0_weight = 1 - (t_input - delta)
+        x1_weight = t_input - delta
+        std = torch.zeros_like(x_t)
+    elif method == "flow_sde":
+        denom = torch.where(timesteps == 1, timesteps[1], timesteps)
+        sigma = noise_level * torch.sqrt(timesteps / (1 - denom))[step]
+        x0_weight = 1 - (t_input - delta)
+        x1_weight = (t_input - delta) - sigma * sigma * delta / (2 * t_input)
+        std = torch.full_like(x_t, torch.sqrt(delta) * sigma)
+    else:
+        raise NotImplementedError(
+            f"Unsupported rollout noise method {method!r}; expected flow_ode or flow_sde."
+        )
+
+    return x0_pred * x0_weight + x1_pred * x1_weight, std
 
 
 @dataclass
@@ -429,6 +503,23 @@ class PI05WS1Scheduler(Scheduler):
         run at the full ``max_batch_size`` shape (constant captured
         graphs); the padded tail is sliced off before returning.
         """
+        return self._step(request, rollout_config=None)
+
+    @torch.no_grad()
+    def rollout_step(
+        self, request: PI05Request, rollout_config: PI05RolloutConfig
+    ) -> PI05RolloutResult:
+        """Run the opt-in PPO behavior policy and expose its sampled path."""
+        result = self._step(request, rollout_config=rollout_config)
+        assert isinstance(result, PI05RolloutResult)
+        return result
+
+    def _step(
+        self,
+        request: PI05Request,
+        *,
+        rollout_config: PI05RolloutConfig | None,
+    ) -> torch.Tensor | PI05RolloutResult:
         cfg = self.cfg
         device = self.device
         dtype = self.params_dtype
@@ -523,7 +614,11 @@ class PI05WS1Scheduler(Scheduler):
                 position_ids=layout.position_ids,
                 write_indices=layout.write_indices,
             )
-            self.llm_runner.forward(llm_batch, n_per_sample=layout.n_per_sample)
+            prefix_output = self.llm_runner.forward(
+                llm_batch,
+                n_per_sample=layout.n_per_sample,
+                return_output=rollout_config is not None,
+            )
 
         # 5. Plan the expert joint-attention metadata — same gating as the
         # prefix: only re-plan when the layout changed.
@@ -560,7 +655,96 @@ class PI05WS1Scheduler(Scheduler):
                     device=device,
                 )
                 noise[:actual_B] = request.noise.to(device=device, dtype=dtype)
-            x_t = self.expert_runner.forward(noise)
+            if rollout_config is None:
+                x_t = self.expert_runner.forward(noise)
+            else:
+                if self.expert_runner.graph is not None:
+                    raise RuntimeError(
+                        "PI05 rollout_step requires use_cuda_graph=False so each "
+                        "sampled denoise transition can be exposed."
+                    )
+                if not 0 < rollout_config.action_chunk <= cfg.chunk_size:
+                    raise ValueError(
+                        f"rollout action_chunk={rollout_config.action_chunk} must be "
+                        f"in [1, model chunk_size={cfg.chunk_size}]."
+                    )
+                if not 0 < rollout_config.action_dim <= cfg.max_action_dim:
+                    raise ValueError(
+                        f"rollout action_dim={rollout_config.action_dim} must be in "
+                        f"[1, {cfg.max_action_dim}]."
+                    )
+                if self.model.value_head is None:
+                    raise RuntimeError(
+                        "PI05 rollout_step requires PI05Args.add_value_head=True."
+                    )
+                if prefix_output is None:
+                    raise RuntimeError("PI05 prefix runner did not return hidden states.")
+
+                num_steps = cfg.num_inference_steps
+                chosen = rollout_config.denoise_index
+                if chosen is None:
+                    chosen = random.randint(0, num_steps - 1)
+                if not 0 <= chosen < num_steps:
+                    raise ValueError(
+                        f"denoise_index={chosen} must be in [0, {num_steps - 1}]."
+                    )
+
+                denoise_inds = torch.full(
+                    (actual_B, num_steps), chosen, device=device, dtype=torch.long
+                )
+                x_t = noise.to(torch.float32)
+                chains = [x_t[:actual_B].clone()]
+                log_probs: list[torch.Tensor] = []
+                for step in range(num_steps):
+                    velocity = self.expert_runner.forward_velocity(x_t, step).float()
+                    method = (
+                        rollout_config.noise_method
+                        if step == chosen
+                        else "flow_ode"
+                    )
+                    mean, std = _sample_mean_var(
+                        x_t,
+                        velocity,
+                        step,
+                        method=method,
+                        noise_level=rollout_config.noise_level,
+                        num_steps=num_steps,
+                    )
+                    x_t = mean + torch.randn_like(mean) * std
+                    log_probs.append(_gaussian_logprob(x_t, mean, std))
+                    chains.append(x_t[:actual_B].clone())
+
+                stacked_log_probs = torch.stack(log_probs, dim=1)
+                prev_logprobs = stacked_log_probs[:actual_B, chosen]
+                prev_logprobs = prev_logprobs[
+                    :, : rollout_config.action_chunk, : rollout_config.action_dim
+                ].float().contiguous()
+
+                prefix_3d = prefix_output.view(max_B, layout.n_per_sample, -1)
+                prefix_mask = torch.cat(
+                    [
+                        torch.ones(
+                            max_B,
+                            self.image_token_count,
+                            dtype=torch.bool,
+                            device=device,
+                        ),
+                        layout.lang_mask,
+                    ],
+                    dim=1,
+                )
+                mask = prefix_mask.unsqueeze(-1).to(prefix_3d.dtype)
+                pooled = (prefix_3d * mask).sum(dim=1)
+                pooled = pooled / mask.sum(dim=1).clamp(min=1)
+                prev_values = self.model.value_head(pooled)[:actual_B, :1]
+
+                return PI05RolloutResult(
+                    actions=x_t[:actual_B].clone(),
+                    chains=torch.stack(chains, dim=1).contiguous(),
+                    denoise_inds=denoise_inds,
+                    prev_logprobs=prev_logprobs,
+                    prev_values=prev_values.float().contiguous(),
+                )
         # ``x_t`` aliases the captured graph's static output buffer — clone
         # it (and drop the padded tail) so the result survives the next step.
         return x_t[:actual_B].clone()
@@ -791,4 +975,9 @@ class PI05WS1Scheduler(Scheduler):
             )
 
 
-__all__ = ["PI05Request", "PI05WS1Scheduler"]
+__all__ = [
+    "PI05Request",
+    "PI05RolloutConfig",
+    "PI05RolloutResult",
+    "PI05WS1Scheduler",
+]

@@ -387,8 +387,12 @@ class PI05LLMRunner(ModelRunner):
             self._capture_plan = self.attn_backend.init_forward_metadata(meta)
 
     def forward(
-        self, batch: LLMForwardBatch, *, n_per_sample: int | None = None
-    ) -> None:
+        self,
+        batch: LLMForwardBatch,
+        *,
+        n_per_sample: int | None = None,
+        return_output: bool = False,
+    ) -> torch.Tensor | None:
         """Run the prefix forward for the given prefix-length bucket.
 
         ``n_per_sample`` selects which captured graph to replay (the
@@ -403,21 +407,21 @@ class PI05LLMRunner(ModelRunner):
                     f"no captured LLM graph for n_per_sample={n_ps}; "
                     f"captured buckets: {sorted(self.graphs)}."
                 )
-            graph.replay(
+            output = graph.replay(
                 {
                     "hidden_states": batch.hidden_states,
                     "position_ids": batch.position_ids,
                     "write_indices": batch.write_indices,
                 }
             )
-            return None
+            return output if return_output else None
         # Non-cuda-graph path.
-        self._fwd(
+        output = self._fwd(
             hidden_states=batch.hidden_states,
             position_ids=batch.position_ids,
             write_indices=batch.write_indices,
         )
-        return None
+        return output if return_output else None
 
 
 # ============================================================================ #
@@ -764,6 +768,15 @@ class PI05ExpertRunner(ModelRunner):
         if self.graph is not None:
             return self.graph.replay({"noise": noise})
         return self._fwd_loop(noise=noise)
+
+    def forward_velocity(self, x_t: torch.Tensor, step: int) -> torch.Tensor:
+        """Run one denoise model evaluation for training trajectory collection."""
+        if self.graph is not None:
+            raise RuntimeError(
+                "PI05 training rollout requires use_cuda_graph=False; the inference "
+                "graph captures the full deterministic Euler loop."
+            )
+        return self._one_step(x_t.to(self.params_dtype), int(step))
 
 
 __all__ = [
