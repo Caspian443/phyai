@@ -441,6 +441,14 @@ class PI05WS1Scheduler(Scheduler):
         self.vision_runner.setup()
         self.llm_runner.setup(self._n_per_sample_buckets)
 
+        # Precompute the time-embedding table for the linear flow-matching
+        # schedule ``t = 1.0 + step * (-1/N)``. ``embed_time`` is the full
+        # MLP (sinusoidal -> Linear -> SiLU -> Linear -> SiLU); its output
+        # depends only on the time scalar and the time-MLP weights, both
+        # fixed across inferences, so a one-time precompute keeps those
+        # matmuls out of the captured Euler loop.
+        # Bind the schedule before the expert runner captures: its graph
+        # unrolls all N steps and reads ``time_emb_table[step]`` in-graph.
         self.refresh_weight_dependent_state()
 
         # Suffix write indices are constant — bind them once, sized for
@@ -474,12 +482,7 @@ class PI05WS1Scheduler(Scheduler):
             num_steps, dtype=torch.float32, device=self.device
         ) * (-1.0 / num_steps)
         updated_time_embeddings = self.model.heads.embed_time(times).contiguous()
-        if (
-            self.time_emb_table is not None
-            and self.time_emb_table.shape == updated_time_embeddings.shape
-            and self.time_emb_table.dtype == updated_time_embeddings.dtype
-            and self.time_emb_table.device == updated_time_embeddings.device
-        ):
+        if self.time_emb_table is not None:
             self.time_emb_table.copy_(updated_time_embeddings)
         else:
             self.time_emb_table = updated_time_embeddings
@@ -678,7 +681,9 @@ class PI05WS1Scheduler(Scheduler):
                         "PI05 rollout_step requires PI05Args.add_value_head=True."
                     )
                 if prefix_output is None:
-                    raise RuntimeError("PI05 prefix runner did not return hidden states.")
+                    raise RuntimeError(
+                        "PI05 prefix runner did not return hidden states."
+                    )
 
                 num_steps = cfg.num_inference_steps
                 chosen = rollout_config.denoise_index
@@ -698,9 +703,7 @@ class PI05WS1Scheduler(Scheduler):
                 for step in range(num_steps):
                     velocity = self.expert_runner.forward_velocity(x_t, step).float()
                     method = (
-                        rollout_config.noise_method
-                        if step == chosen
-                        else "flow_ode"
+                        rollout_config.noise_method if step == chosen else "flow_ode"
                     )
                     mean, std = _sample_mean_var(
                         x_t,
@@ -716,9 +719,13 @@ class PI05WS1Scheduler(Scheduler):
 
                 stacked_log_probs = torch.stack(log_probs, dim=1)
                 prev_logprobs = stacked_log_probs[:actual_B, chosen]
-                prev_logprobs = prev_logprobs[
-                    :, : rollout_config.action_chunk, : rollout_config.action_dim
-                ].float().contiguous()
+                prev_logprobs = (
+                    prev_logprobs[
+                        :, : rollout_config.action_chunk, : rollout_config.action_dim
+                    ]
+                    .float()
+                    .contiguous()
+                )
 
                 prefix_3d = prefix_output.view(max_B, layout.n_per_sample, -1)
                 prefix_mask = torch.cat(

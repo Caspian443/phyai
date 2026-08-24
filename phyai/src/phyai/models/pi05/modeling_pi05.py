@@ -1056,9 +1056,7 @@ class PI05ValueHead(nn.Module):
         super().__init__()
         widths = (input_dim, 1024, 512, 256, 1)
         self.layers = nn.ModuleList()
-        for index, (in_features, out_features) in enumerate(
-            pairwise(widths)
-        ):
+        for index, (in_features, out_features) in enumerate(pairwise(widths)):
             linear = ReplicatedLinear(
                 in_features,
                 out_features,

@@ -194,7 +194,7 @@ class EngineArgs:
 
     ``config`` is used as the *base* the ``PHYAI_*`` env vars overlay on
     top of: the engine resolves the effective config via
-    :meth:`EngineConfig.from_env(base=config) <EngineConfig.from_env>`
+    :meth:`EngineConfig.from_env(base=config) <EngineConfig.from_env>`,
     so any set env var overrides the matching field while every unset
     field carries over from ``config`` verbatim. Leave ``config`` as
     ``None`` to start from :meth:`EngineConfig.auto` (host-appropriate
@@ -252,6 +252,19 @@ class Engine:
         return tuple(cls._plugins.keys())
 
     def __init__(self, args: EngineArgs) -> None:
+        # Resolve EngineConfig and seed the process singleton so every
+        # model constructor downstream picks up the requested
+        # device / dtype / backends without explicit plumbing.
+        # ``from_env(base=args.config)`` makes the explicit config the
+        # base and overlays any set ``PHYAI_*`` env var on top, so a
+        # var like PHYAI_DEBUG_TENSOR_DUMP_DIR is honoured even when the
+        # caller passed a config (env = run-time toggle). ``args.config``
+        # is None -> the base falls back to ``auto()`` inside from_env.
+        # When a tensor-dump directory ends up set, force eager *before*
+        # installing the singleton: the dumper's forward hooks can't
+        # fire inside a captured CUDA-graph replay, and the pi05
+        # scheduler reads ``use_cuda_graph`` off this singleton at
+        # setup time, so the flip has to land before any runner builds.
         resolved = EngineConfig.from_env(base=args.config)
         self._dump_enabled = resolved.runtime.debug_tensor_dump_dir is not None
         if self._dump_enabled:
@@ -272,6 +285,9 @@ class Engine:
 
         device_type = torch.device(self.config.device.target).type
 
+        # Per-concern bootstrap. Each ``init_*`` is independently
+        # callable; this method is the only orchestrator. Saved
+        # default dtype is restored in :meth:`close`.
         self._saved_default_dtype: torch.dtype = init_cuda(
             self.config.device.target, self.config.device.params_dtype
         )
@@ -281,6 +297,15 @@ class Engine:
             world_size=parallel.world_size, device_type=device_type
         )
 
+        # phyai mesh + linear dispatcher. Both are process-level
+        # singletons; building them here means model constructors
+        # don't have to. The mesh is always 6-axis
+        # (dp / cfg / ep / sp / cp / tp); axes the user didn't size stay
+        # at ``1`` and short-circuit through the collective ops without
+        # any process-group traffic, while existing model code that
+        # addresses ``axis="tp"`` keeps working unchanged. ``cfg`` sits
+        # just outside ``tp`` so each CFG-parallel group is a contiguous
+        # tensor-parallel block.
         P.init(
             layout=(
                 parallel.dp_size,
@@ -295,6 +320,7 @@ class Engine:
         )
         L.init()
 
+        # Resolve the requested plugin and validate the args bundle.
         entry_cls = self._plugins.get(args.plugin)
         if entry_cls is None:
             raise ValueError(
@@ -307,6 +333,8 @@ class Engine:
                 f"{type(args.plugin_args).__name__}."
             )
 
+        # Instantiate the entry and run setup. The entry owns its
+        # model / scheduler / runners from this point on.
         self.args = args
         self.entry: Entry = entry_cls()
         self.entry.setup(args.plugin_args)
@@ -316,10 +344,20 @@ class Engine:
         self._weight_update_failed = False
         self._version = 0
 
+        # If tensor dumping is on, attach the dumper to the modules the
+        # plugin exposes. Built after setup() so the model + weights are
+        # fully constructed; the runners were already forced eager in
+        # step 1, so the leaf forward hooks will actually fire.
         if self._dump_enabled:
             self._dumper = self._build_dumper()
 
     def _build_dumper(self) -> TensorDumper | None:
+        """Construct the tensor dumper from the entry's dump targets.
+
+        Returns ``None`` (and warns) when the plugin exposes no dump
+        targets, so a mis-wired plugin surfaces loudly instead of
+        silently recording nothing.
+        """
         runtime = self.config.runtime
         targets = self.entry.dump_targets()
         if not targets:
@@ -340,12 +378,26 @@ class Engine:
         )
 
     def _resolve_dump_filter(self):
+        """Turn the two runtime dump-filter knobs into a single filter spec.
+
+        ``debug_tensor_dump_filter_fn`` (a ``"module:func"`` path) wins and
+        is resolved to a callable; otherwise the regex tuple
+        ``debug_tensor_dump_filter`` (or ``None`` -> record everything) is
+        passed through. The two are already validated mutually exclusive on
+        :class:`~phyai.engine_config.RuntimeConfig`.
+        """
         runtime = self.config.runtime
         if runtime.debug_tensor_dump_filter_fn is not None:
             return load_filter_fn(runtime.debug_tensor_dump_filter_fn)
         return runtime.debug_tensor_dump_filter
 
     def step(self, request: Any) -> Any:
+        """Run one inference round; forwards to the registered entry.
+
+        When tensor dumping is active, the activations recorded during
+        this round are flushed to a single ``pass{N}.pt`` file once the
+        entry returns.
+        """
         with self._model_lock:
             self._require_usable()
             result = self.entry.step(request)
@@ -395,8 +447,8 @@ class Engine:
         """Forward one named-tensor batch to the active plugin."""
         if not self._weight_update_active:
             raise RuntimeError("begin_weight_update() must be called first.")
-        self.entry.update_weights(weights)
         self._weight_update_received = True
+        self.entry.update_weights(weights)
 
     def finish_weight_update(self, version: int | None = None) -> Any:
         """Finalize an update and commit its version only after validation."""
@@ -429,6 +481,8 @@ class Engine:
             self._model_lock.release()
 
     def close(self) -> None:
+        """Release the plugin entry's resources, then tear down distributed
+        state if the engine was the one to bring it up."""
         if self._weight_update_active:
             self.abort_weight_update()
         if self._dumper is not None:
@@ -448,14 +502,29 @@ __all__ = [
     "EntryArgs",
 ]
 
+
+# ---------------------------------------------------------------------- #
+# Plugin discovery — explicit imports at module bottom.                  #
+#                                                                        #
+# Each ``main_*`` module decorates its Entry subclass with               #
+# ``@Engine.register``; importing the module triggers registration.      #
+# Add one import line per new model. Imports go at the bottom because    #
+# plugin modules ``from phyai.engine import Engine, Entry, EntryArgs``;  #
+# this module's symbols must be defined first.                           #
+# ---------------------------------------------------------------------- #
+
 from phyai.models.pi0 import main_pi0 as _main_pi0  # noqa: E402, F401
 from phyai.models.pi05 import main_pi05 as _main_pi05  # noqa: E402, F401
+from phyai.models.gr00t_n17 import main_gr00t_n17 as _main_gr00t_n17  # noqa: E402, F401
 from phyai.models.pi05 import main_pi05_wn as _main_pi05_wn  # noqa: E402, F401
+from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
+    main_minicpm_gr00t as _main_minicpm_gr00t,
+)
 from phyai.models.cosmos3 import main_cosmos3 as _main_cosmos3  # noqa: E402, F401
-from phyai.models.cosmos3 import (
+from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy as _main_cosmos3_policy,
 )
 from phyai.models.cosmos3 import main_cosmos3_wn as _main_cosmos3_wn  # noqa: E402, F401
-from phyai.models.cosmos3 import (
+from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy_wn as _main_cosmos3_policy_wn,
 )

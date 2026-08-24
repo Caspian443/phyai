@@ -55,13 +55,18 @@ class StateTokenizerPrepareStep(ProcessorStep):
 
         out = transition.copy()
         state = transition.get(STATE)
-        if state is not None and self.include_state_in_prompt:
-            discretized = discretize_state(state, num_bins=self.num_bins)
-            out[PROMPT] = build_prompts(list(tasks), discretized)
+        if self.include_state_in_prompt:
+            if state is not None:
+                discretized = discretize_state(state, num_bins=self.num_bins)
+                out[PROMPT] = build_prompts(list(tasks), discretized)
+            else:
+                out[PROMPT] = [
+                    f"Task: {t.strip().replace('_', ' ').replace(chr(10), ' ')};\nAction: "
+                    for t in tasks
+                ]
         else:
             out[PROMPT] = [
-                f"{t.strip().replace('_', ' ').replace(chr(10), ' ')}\n"
-                for t in tasks
+                f"{t.strip().replace('_', ' ').replace(chr(10), ' ')}\n" for t in tasks
             ]
         return out
 

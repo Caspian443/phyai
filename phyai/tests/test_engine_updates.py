@@ -9,7 +9,8 @@ from phyai.engine import Engine
 
 
 class _Entry:
-    def __init__(self, *, fail_finish: bool = False) -> None:
+    def __init__(self, *, fail_update: bool = False, fail_finish: bool = False) -> None:
+        self.fail_update = fail_update
         self.fail_finish = fail_finish
         self.events = []
 
@@ -26,6 +27,8 @@ class _Entry:
 
     def update_weights(self, weights):
         self.events.append(("update", weights))
+        if self.fail_update:
+            raise RuntimeError("partial update failed")
 
     def finish_weight_update(self):
         self.events.append("finish")
@@ -74,6 +77,19 @@ def test_failed_finish_keeps_version_and_poison_engine():
     engine.update_weights({"weight": 1})
     with pytest.raises(RuntimeError, match="strict update failed"):
         engine.finish_weight_update(version=7)
+
+    assert engine.version == 0
+    with pytest.raises(RuntimeError, match="partially applied"):
+        engine.step(1)
+
+
+def test_failed_update_poison_engine_after_abort():
+    engine = _engine(_Entry(fail_update=True))
+
+    engine.begin_weight_update()
+    with pytest.raises(RuntimeError, match="partial update failed"):
+        engine.update_weights({"weight": 1})
+    engine.abort_weight_update()
 
     assert engine.version == 0
     with pytest.raises(RuntimeError, match="partially applied"):

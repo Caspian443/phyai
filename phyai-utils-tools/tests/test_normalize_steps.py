@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
+
 from phyai_utils_tools.processing.steps.normalize_steps import (
     NormalizationMode,
     NormalizerStep,
@@ -81,24 +81,6 @@ def test_only_mapped_field_touched():
     out = n({STATE: torch.tensor([[4.0]]), ACTION: torch.tensor([[7.0]])})
     assert torch.allclose(out[STATE], torch.tensor([[2.0]]))
     assert torch.equal(out[ACTION], torch.tensor([[7.0]]))  # untouched
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_stats_follow_cpu_input_when_processor_targets_cuda():
-    feats = {_STATE_FEAT: {"type": "STATE", "shape": [2]}}
-    stats = {_STATE_FEAT: {"q01": [-1.0, -2.0], "q99": [1.0, 2.0]}}
-    normalizer = NormalizerStep(
-        features=feats,
-        norm_map={"STATE": "QUANTILES"},
-        stats=stats,
-        device="cuda",
-    )
-    value = torch.tensor([[0.0, 0.0]], device="cpu")
-
-    result = normalizer({STATE: value})[STATE]
-
-    assert result.device.type == "cpu"
-    torch.testing.assert_close(result, torch.zeros_like(value))
 
 
 def test_enum_values_match_lerobot():

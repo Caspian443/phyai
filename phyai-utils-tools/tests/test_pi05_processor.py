@@ -131,3 +131,11 @@ def test_task_only_prompt_matches_native_openpi():
     )
 
     assert result["prompt"] == ["pick up the cup\n", "put the bowl down\n"]
+
+
+def test_task_only_prompt_keeps_existing_default_format():
+    step = StateTokenizerPrepareStep()
+
+    result = step({"task": ["pick_up the cup"]})
+
+    assert result["prompt"] == ["Task: pick up the cup;\nAction: "]

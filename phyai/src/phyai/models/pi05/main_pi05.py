@@ -49,7 +49,8 @@ from phyai.models.pi05.scheduler_ws1_pi05 import (
     PI05WS1Scheduler,
 )
 from phyai.utils import load_config, this_rank_log
-from phyai.weights import LoadReport, WeightLoadSession, load_pretrained
+from phyai.weights import LoadReport, load_pretrained
+from phyai.weights.loader import WeightLoadSession
 
 logger = logging.getLogger(__name__)
 
@@ -367,7 +368,6 @@ class PI05Entry(Entry):
             )
         report = self.weight_update.finish(
             strict=self.require_full_hot_update,
-            require_all=self.require_full_hot_update,
         )
         if report.unexpected:
             this_rank_log(
