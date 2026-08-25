@@ -517,6 +517,35 @@ class PI05WS1Scheduler(Scheduler):
         assert isinstance(result, PI05RolloutResult)
         return result
 
+    def _prepare_noise(
+        self,
+        request: PI05Request,
+        *,
+        actual_batch_size: int,
+        rollout_config: PI05RolloutConfig | None,
+    ) -> torch.Tensor:
+        del rollout_config
+        shape = (
+            self.max_batch_size,
+            self.cfg.chunk_size,
+            self.cfg.max_action_dim,
+        )
+        if request.noise is None:
+            return torch.randn(
+                shape,
+                dtype=self.params_dtype,
+                device=self.device,
+            )
+        noise = torch.zeros(
+            shape,
+            dtype=self.params_dtype,
+            device=self.device,
+        )
+        noise[:actual_batch_size] = request.noise.to(
+            device=self.device, dtype=self.params_dtype
+        )
+        return noise
+
     def _step(
         self,
         request: PI05Request,
@@ -641,23 +670,11 @@ class PI05WS1Scheduler(Scheduler):
                     "PI05WS1Scheduler.step() called before setup(); "
                     "the time-embedding lookup table has not been built."
                 )
-            if request.noise is None:
-                noise = torch.randn(
-                    max_B,
-                    cfg.chunk_size,
-                    cfg.max_action_dim,
-                    dtype=dtype,
-                    device=device,
-                )
-            else:
-                noise = torch.zeros(
-                    max_B,
-                    cfg.chunk_size,
-                    cfg.max_action_dim,
-                    dtype=dtype,
-                    device=device,
-                )
-                noise[:actual_B] = request.noise.to(device=device, dtype=dtype)
+            noise = self._prepare_noise(
+                request,
+                actual_batch_size=actual_B,
+                rollout_config=rollout_config,
+            )
             if rollout_config is None:
                 x_t = self.expert_runner.forward(noise)
             else:
