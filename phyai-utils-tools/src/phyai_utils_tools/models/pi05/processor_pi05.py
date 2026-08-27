@@ -45,6 +45,7 @@ from phyai_utils_tools.processing.transition import (
     INPUT_IDS,
     LANG_LENS,
     PIXEL_VALUES,
+    STATE,
     Transition,
 )
 from phyai_utils_tools.tokenizer import get_tokenizer
@@ -78,6 +79,7 @@ class PI05ProcessedInputs:
     pixel_values: torch.Tensor  # (B, num_images, C, image_size, image_size)
     input_ids: torch.Tensor  # (B, tokenizer_max_length) int64
     lang_lens: torch.Tensor  # (B,) int64
+    state: torch.Tensor | None = None  # normalized state retained for PPO replay
 
 
 def _features_for_stats(
@@ -151,6 +153,7 @@ class PI05Processor(BaseModelProcessor):
             pixel_values=transition[PIXEL_VALUES],
             input_ids=transition[INPUT_IDS],
             lang_lens=transition[LANG_LENS],
+            state=transition.get(STATE),
         )
 
     @staticmethod

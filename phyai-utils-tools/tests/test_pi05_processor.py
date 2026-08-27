@@ -58,6 +58,7 @@ def test_preprocess_shapes(monkeypatch):
     assert out.pixel_values.shape == (b, 2, 3, 224, 224)
     assert out.input_ids.shape == (b, 200) and out.input_ids.dtype == torch.int64
     assert out.lang_lens.shape == (b,) and out.lang_lens.tolist() == [4, 4, 4]
+    assert out.state is not None and out.state.shape == (b, 7)
 
 
 def test_preprocess_stacked_tensor_input(monkeypatch):
