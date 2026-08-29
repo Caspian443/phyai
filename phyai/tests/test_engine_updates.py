@@ -18,8 +18,8 @@ class _Entry:
         self.events.append(("step", request))
         return request + 1
 
-    def rollout_step(self, request, **kwargs):
-        self.events.append(("rollout", request, kwargs))
+    def rollout_step(self, request):
+        self.events.append(("rollout", request))
         return request + 2
 
     def begin_weight_update(self):
@@ -56,7 +56,7 @@ def test_step_return_type_and_rollout_api_are_independent():
     engine = _engine(_Entry())
 
     assert engine.step(3) == 4
-    assert engine.rollout_step(3, mode="train") == 5
+    assert engine.rollout_step(3) == 5
 
 
 def test_version_commits_only_after_successful_update():

@@ -39,7 +39,6 @@ class PI05RLEntry(PI05Entry):
             self.model = PI05RLModel(
                 config,
                 vision_params_dtype=args.vision_params_dtype,
-                add_value_head=args.add_value_head,
                 device=eng.device.target,
             )
 
@@ -51,15 +50,13 @@ class PI05RLEntry(PI05Entry):
                 strict=args.weight_strict,
             )
 
-        if self.model.value_head is not None:
-            self.model.value_head.require_hot_update_weights()
-
         self.scheduler = PI05RLWS1Scheduler(
             self.model,
             max_batch_size=args.max_batch_size,
             num_images=self._resolve_num_images(args.inputs_image_shape, config),
             device=eng.device.target,
             use_cuda_graph=eng.runtime.use_cuda_graph,
+            capture_rollout=args.capture_rollout,
         )
         self.scheduler.setup()
 

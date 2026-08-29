@@ -20,6 +20,7 @@ from phyai.layers.attention.diffusion import DiffusionAttention, DiffusionAttnCt
 from phyai.layers.conv import Conv2d
 from phyai.layers.layer_norm import AdaRMSNorm, GemmaRMSNorm, LayerNorm
 from phyai.layers.linear import (
+    Bf16Spec,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -1043,44 +1044,125 @@ class ActionTimeHeads(nn.Module):
         return F.silu(h)
 
 
+class _ValueLinear(ReplicatedLinear):
+    """ReplicatedLinear adapter for an ``nn.Sequential`` value MLP."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = super().forward(x)
+        return out
+
+
 class PI05ValueHead(nn.Module):
-    """RLinf-compatible prefix value head used only for training rollouts."""
+    """RLinf-compatible MLP critic over pooled pi0.5 hidden features.
+
+    Value inference stays in fp32. The sequential indices intentionally match
+    RLinf's checkpoint keys: ``value_head.mlp.{0,2,4,6}.{weight,bias}``.
+    """
 
     def __init__(
         self,
         input_dim: int,
+        hidden_sizes: tuple[int, ...],
         *,
-        params_dtype: torch.dtype,
-        device: torch.device | str | None,
+        device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        widths = (input_dim, 1024, 512, 256, 1)
-        self.layers = nn.ModuleList()
+        widths = (input_dim, *hidden_sizes, 1)
+        layers: list[nn.Module] = []
         for index, (in_features, out_features) in enumerate(pairwise(widths)):
-            linear = ReplicatedLinear(
-                in_features,
-                out_features,
+            linear_index = 2 * index
+            linear = _ValueLinear(
+                in_features=in_features,
+                out_features=out_features,
                 bias=True,
-                params_dtype=params_dtype,
+                params_dtype=torch.float32,
+                spec=Bf16Spec(),
                 device=device,
-                prefix=f"value_head.mlp.{index * 2}",
+                prefix=f"value_head.mlp.{linear_index}",
             )
-            for parameter in linear.parameters():
-                parameter.optional = True
-            self.layers.append(linear)
+            layers.append(linear)
+            if index < len(widths) - 2:
+                layers.append(nn.ReLU())
+        self.mlp = nn.Sequential(*layers)
+        self._initialize_weights()
 
-    def require_hot_update_weights(self) -> None:
-        """Make value tensors mandatory after checkpoint initialization."""
-        for parameter in self.parameters():
-            parameter.optional = False
+    @torch.no_grad()
+    def _initialize_weights(self) -> None:
+        """Match RLinf's initialization when starting from an actor checkpoint."""
+        last = len(self.mlp) - 1
+        for index, module in enumerate(self.mlp):
+            if not isinstance(module, _ValueLinear):
+                continue
+            if index == last:
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            else:
+                nn.init.kaiming_normal_(
+                    module.weight, mode="fan_out", nonlinearity="relu"
+                )
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+            # A base actor checkpoint has no critic. Strict loading may omit
+            # these initialized parameters until the RL worker synchronizes
+            # its ValueHead weights.
+            module.weight.optional = True
+            if module.bias is not None:
+                module.bias.optional = True
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        x = hidden_states
-        for index, linear in enumerate(self.layers):
-            x, _ = linear(x)
-            if index + 1 < len(self.layers):
-                x = F.relu(x)
-        return x
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.mlp(features.to(torch.float32))
+
+
+def value_from_prefix(
+    value_head: nn.Module,
+    prefix_out: torch.Tensor,
+    prefix_mask: torch.Tensor,
+    *,
+    mode: str = "mean_token",
+) -> torch.Tensor:
+    """Masked-mean prefix features and return one fp32 value per sample.
+
+    This matches RLinf's pi0.5 ``mean_token`` path: only valid image and
+    language positions participate in the mean. ``prefix_out`` is kept in its
+    model dtype during pooling, then :class:`PI05ValueHead` promotes the pooled
+    features to fp32.
+    """
+    if mode != "mean_token":
+        raise NotImplementedError(
+            f"prefix value mode {mode!r} is unsupported; expected 'mean_token'."
+        )
+    if prefix_out.dim() != 3:
+        raise ValueError(
+            f"prefix_out must be 3-D (B, T, D), got {tuple(prefix_out.shape)}."
+        )
+    if prefix_mask.shape != prefix_out.shape[:2]:
+        raise ValueError(
+            f"prefix_mask shape {tuple(prefix_mask.shape)} must equal "
+            f"prefix_out[:2] {tuple(prefix_out.shape[:2])}."
+        )
+    mask = prefix_mask.to(prefix_out.dtype).unsqueeze(-1)
+    pooled = (prefix_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+    return value_head(pooled)[:, 0].to(torch.float32)
+
+
+def value_from_suffix(
+    value_head: nn.Module,
+    suffix_out: torch.Tensor,
+    *,
+    action_chunk: int | None = None,
+    detach: bool = False,
+) -> torch.Tensor:
+    """Mean suffix features and return one fp32 value per sample."""
+    if suffix_out.dim() != 3:
+        raise ValueError(
+            f"suffix_out must be 3-D (B, T, D), got {tuple(suffix_out.shape)}."
+        )
+    features = suffix_out.to(torch.float32)
+    if action_chunk is not None:
+        features = features[:, :action_chunk]
+    features = features.mean(dim=1)
+    if detach:
+        features = features.detach()
+    return value_head(features)[:, 0].to(torch.float32)
 
 
 class PI05Model(nn.Module):
@@ -1106,7 +1188,6 @@ class PI05Model(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         vision_params_dtype: torch.dtype | None = None,
-        add_value_head: bool = False,
         attn_backend: str | None = None,
         norm_backend: str | None = None,
         rope_backend: str | None = None,
@@ -1227,11 +1308,11 @@ class PI05Model(nn.Module):
         )
         self.value_head = (
             PI05ValueHead(
-                config.text.hidden_size,
-                params_dtype=params_dtype,
+                config.value_head_input_dim,
+                config.value_head_hidden_sizes,
                 device=device,
             )
-            if add_value_head
+            if config.add_value_head
             else None
         )
 

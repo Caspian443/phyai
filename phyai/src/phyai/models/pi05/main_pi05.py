@@ -44,8 +44,8 @@ from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_ws1_pi05 import (
     PI05Request,
-    PI05RolloutConfig,
-    PI05RolloutResult,
+    PI05RolloutOutput,
+    PI05RolloutRequest,
     PI05WS1Scheduler,
 )
 from phyai.utils import load_config, this_rank_log
@@ -142,6 +142,11 @@ class PI05Args(EntryArgs):
     at request time. ``None`` (default) keeps the pi05_base contract of three
     cameras already at ``image_size``. ``C`` must equal
     ``config.vision.num_channels``.
+
+    ``capture_rollout=True`` captures the expert's trajectory-producing
+    graph instead of the final-action-only inference graph. Set it for an RL
+    rollout engine; :class:`PI05RolloutRequest` remains functional without it
+    but runs the expert loop eagerly.
     """
 
     checkpoint_dir: str | Path | None = None
@@ -151,7 +156,7 @@ class PI05Args(EntryArgs):
     weight_strict: bool = True
     vision_params_dtype: torch.dtype | None = None
     inputs_image_shape: list[list[int]] | None = None
-    add_value_head: bool = False
+    capture_rollout: bool = False
     require_full_hot_update: bool = False
 
 
@@ -197,7 +202,6 @@ class PI05Entry(Entry):
             self.model = PI05Model(
                 config,
                 vision_params_dtype=args.vision_params_dtype,
-                add_value_head=args.add_value_head,
                 device=eng.device.target,
             )
 
@@ -209,9 +213,6 @@ class PI05Entry(Entry):
                 strict=args.weight_strict,
             )
 
-        if self.model.value_head is not None:
-            self.model.value_head.require_hot_update_weights()
-
         num_images = self._resolve_num_images(args.inputs_image_shape, config)
 
         self.scheduler = PI05WS1Scheduler(
@@ -220,6 +221,7 @@ class PI05Entry(Entry):
             num_images=num_images,
             device=eng.device.target,
             use_cuda_graph=eng.runtime.use_cuda_graph,
+            capture_rollout=args.capture_rollout,
         )
         self.scheduler.setup()
 
@@ -318,22 +320,24 @@ class PI05Entry(Entry):
         return eng
 
     def step(self, request: PI05Request) -> torch.Tensor:  # type: ignore[override]
-        """Run one pi0.5 inference; return the action chunk ``(B, chunk, action_dim)``."""
+        """Run deterministic pi0.5 inference."""
+        if isinstance(request, PI05RolloutRequest):
+            raise TypeError(
+                "PI05RolloutRequest must be passed to rollout_step(), not step()."
+            )
         if self.scheduler is None:
             raise RuntimeError(
                 "PI05Entry.step called before setup; the scheduler is None."
             )
         return self.scheduler.step(request)
 
-    def rollout_step(
-        self, request: PI05Request, rollout_config: PI05RolloutConfig
-    ) -> PI05RolloutResult:
-        """Run the opt-in training rollout path without changing step()."""
+    def rollout_step(self, request: PI05RolloutRequest) -> PI05RolloutOutput:
+        """Run a pi0.5 RL rollout and return model-space trajectory data."""
         if self.scheduler is None:
             raise RuntimeError(
                 "PI05Entry.rollout_step called before setup; the scheduler is None."
             )
-        return self.scheduler.rollout_step(request, rollout_config)
+        return self.scheduler.rollout_step(request)
 
     def begin_weight_update(self) -> None:
         """Start one incremental HF-named weight update."""
@@ -366,9 +370,7 @@ class PI05Entry(Entry):
             raise RuntimeError(
                 "PI05Entry hot update did not match any PhyAI model weights."
             )
-        report = self.weight_update.finish(
-            strict=self.require_full_hot_update,
-        )
+        report = self.weight_update.finish(strict=self.require_full_hot_update)
         if report.unexpected:
             this_rank_log(
                 logger,

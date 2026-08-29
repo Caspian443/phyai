@@ -119,15 +119,10 @@ class Entry(abc.ABC):
     def step(self, request: Any) -> Any:
         """Run one inference round. Request / response shape is plugin-defined."""
 
-    def rollout_step(self, request: Any, **kwargs: Any) -> Any:
-        """Run an opt-in training rollout round.
-
-        Plugins may expose structured behavior-policy state here without changing
-        the return type of :meth:`step` for existing inference callers.
-        """
-        del request, kwargs
+    def rollout_step(self, request: Any) -> Any:
+        """Run one RL rollout round when the plugin supports trajectory output."""
         raise NotImplementedError(
-            f"Plugin {self.name!r} does not support training rollout output."
+            f"plugin {self.name!r} does not implement rollout_step()."
         )
 
     def close(self) -> None:
@@ -405,11 +400,11 @@ class Engine:
                 self._dumper.flush_pass()
             return result
 
-    def rollout_step(self, request: Any, **kwargs: Any) -> Any:
-        """Return plugin-specific training state without changing ``step``."""
+    def rollout_step(self, request: Any) -> Any:
+        """Run one RL rollout round through the registered entry."""
         with self._model_lock:
             self._require_usable()
-            result = self.entry.rollout_step(request, **kwargs)
+            result = self.entry.rollout_step(request)
             if self._dumper is not None:
                 self._dumper.flush_pass()
             return result
