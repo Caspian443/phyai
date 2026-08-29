@@ -6,6 +6,7 @@ import threading
 
 import pytest
 from phyai.engine import Engine
+from phyai.models.pi05.main_pi05 import PI05Entry
 
 
 class _Entry:
@@ -94,3 +95,43 @@ def test_failed_update_poison_engine_after_abort():
     assert engine.version == 0
     with pytest.raises(RuntimeError, match="partially applied"):
         engine.step(1)
+
+
+class _WeightUpdate:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.report = type("Report", (), {"loaded": ["weight"]})()
+
+    def finish(self, *, strict: bool):
+        assert strict
+        self.events.append("finish")
+        return type("Report", (), {"unexpected": []})()
+
+
+class _Scheduler:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def setup(self) -> None:
+        self.events.append("setup")
+
+    def refresh_weight_dependent_state(self) -> None:
+        self.events.append("refresh")
+
+
+def test_first_full_weight_update_sets_up_scheduler_before_rollout():
+    events: list[str] = []
+    entry = PI05Entry()
+    entry.scheduler = _Scheduler(events)  # type: ignore[assignment]
+    entry.require_full_hot_update = True
+    entry.weight_update = _WeightUpdate(events)  # type: ignore[assignment]
+
+    entry.finish_weight_update()
+
+    assert events == ["finish", "setup"]
+    assert entry._scheduler_ready
+
+    entry.weight_update = _WeightUpdate(events)  # type: ignore[assignment]
+    entry.finish_weight_update()
+
+    assert events == ["finish", "setup", "finish", "refresh"]

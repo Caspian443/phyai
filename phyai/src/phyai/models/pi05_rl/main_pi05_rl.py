@@ -26,6 +26,10 @@ class PI05RLEntry(PI05Entry):
         eng = get_engine_config()
         self.weight_remap = args.weight_remap
         self.require_full_hot_update = args.require_full_hot_update
+        if args.defer_scheduler_setup and not args.require_full_hot_update:
+            raise ValueError(
+                "defer_scheduler_setup requires require_full_hot_update=True."
+            )
 
         if args.config is not None:
             config = args.config
@@ -58,7 +62,9 @@ class PI05RLEntry(PI05Entry):
             use_cuda_graph=eng.runtime.use_cuda_graph,
             capture_rollout=args.capture_rollout,
         )
-        self.scheduler.setup()
+        if not args.defer_scheduler_setup:
+            self.scheduler.setup()
+            self._scheduler_ready = True
 
 
 __all__ = ["PI05RLEntry"]

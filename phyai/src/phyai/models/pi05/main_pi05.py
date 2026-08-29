@@ -147,6 +147,13 @@ class PI05Args(EntryArgs):
     graph instead of the final-action-only inference graph. Set it for an RL
     rollout engine; :class:`PI05RolloutRequest` remains functional without it
     but runs the expert loop eagerly.
+
+    ``defer_scheduler_setup=True`` constructs the model and scheduler without
+    warming runners or capturing CUDA graphs. The first complete hot update
+    validates all Actor weights and then runs scheduler setup, so captured
+    graphs observe the final behavior-policy weights rather than checkpoint
+    initialization weights.
+
     """
 
     checkpoint_dir: str | Path | None = None
@@ -158,6 +165,7 @@ class PI05Args(EntryArgs):
     inputs_image_shape: list[list[int]] | None = None
     capture_rollout: bool = False
     require_full_hot_update: bool = False
+    defer_scheduler_setup: bool = False
 
 
 @Engine.register
@@ -175,12 +183,17 @@ class PI05Entry(Entry):
         self.weight_remap: Callable[[str], str | None] | dict[str, str] | None = None
         self.weight_update: WeightLoadSession | None = None
         self.require_full_hot_update = False
+        self._scheduler_ready = False
 
     def setup(self, args: PI05Args) -> None:  # type: ignore[override]
-        """Build model, load weights, construct + warm the scheduler."""
+        """Build the model and scheduler, optionally deferring warmup."""
         eng = get_engine_config()
         self.weight_remap = args.weight_remap
         self.require_full_hot_update = args.require_full_hot_update
+        if args.defer_scheduler_setup and not args.require_full_hot_update:
+            raise ValueError(
+                "defer_scheduler_setup requires require_full_hot_update=True."
+            )
 
         # Resolve config: explicit override > checkpoint folder > defaults.
         if args.config is not None:
@@ -223,7 +236,9 @@ class PI05Entry(Entry):
             use_cuda_graph=eng.runtime.use_cuda_graph,
             capture_rollout=args.capture_rollout,
         )
-        self.scheduler.setup()
+        if not args.defer_scheduler_setup:
+            self.scheduler.setup()
+            self._scheduler_ready = True
 
     @staticmethod
     def _resolve_num_images(
@@ -325,17 +340,19 @@ class PI05Entry(Entry):
             raise TypeError(
                 "PI05RolloutRequest must be passed to rollout_step(), not step()."
             )
-        if self.scheduler is None:
+        if self.scheduler is None or not self._scheduler_ready:
             raise RuntimeError(
-                "PI05Entry.step called before setup; the scheduler is None."
+                "PI05Entry.step requires scheduler setup; finish the initial "
+                "full weight update first."
             )
         return self.scheduler.step(request)
 
     def rollout_step(self, request: PI05RolloutRequest) -> PI05RolloutOutput:
         """Run a pi0.5 RL rollout and return model-space trajectory data."""
-        if self.scheduler is None:
+        if self.scheduler is None or not self._scheduler_ready:
             raise RuntimeError(
-                "PI05Entry.rollout_step called before setup; the scheduler is None."
+                "PI05Entry.rollout_step requires scheduler setup; finish the initial "
+                "full weight update first."
             )
         return self.scheduler.rollout_step(request)
 
@@ -379,7 +396,11 @@ class PI05Entry(Entry):
                 len(report.unexpected),
                 report.unexpected[:5],
             )
-        self.scheduler.refresh_weight_dependent_state()
+        if self._scheduler_ready:
+            self.scheduler.refresh_weight_dependent_state()
+        else:
+            self.scheduler.setup()
+            self._scheduler_ready = True
         self.weight_update = None
         return report
 
@@ -392,6 +413,7 @@ class PI05Entry(Entry):
         if self.scheduler is not None:
             self.scheduler.close()
             self.scheduler = None
+        self._scheduler_ready = False
         self.model = None
 
     def dump_targets(self) -> dict[str, torch.nn.Module]:  # type: ignore[override]
