@@ -659,6 +659,37 @@ class PI05ExpertRunner(ModelRunner):
             else:
                 self._capture_graph()
 
+    def recapture_after_weight_update(self) -> bool:
+        """Rebuild captured expert executables after trainable weights change.
+
+        The rollout graph contains the action expert and action/time heads,
+        which PPO updates. Reusing that executable after an in-place hot update
+        can produce non-finite denoise states even though both source and target
+        parameters are finite. Vision and language-prefix graphs are outside
+        this runner and remain valid when RLinf trains the expert only.
+        """
+        had_inference_graph = self.graph is not None
+        had_rollout_graph = self.rollout_graph is not None
+        if not had_inference_graph and not had_rollout_graph:
+            return False
+
+        torch.cuda.synchronize(self.device)
+        if self.graph is not None:
+            self.graph.reset()
+            self.graph = None
+        if self.rollout_graph is not None:
+            self.rollout_graph.reset()
+            self.rollout_graph = None
+
+        self._capture_plan = self.attn_backend.init_capture_metadata(
+            self._capture_seed_metadata()
+        )
+        if had_inference_graph:
+            self._capture_graph()
+        if had_rollout_graph:
+            self._capture_rollout_graph()
+        return True
+
     def _capture_seed_metadata(self) -> DiffusionAttnMetadata:
         # cu_q is fixed [0, chunk, 2*chunk, ...] across all inferences.
         cu_q = torch.arange(

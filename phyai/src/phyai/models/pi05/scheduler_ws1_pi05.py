@@ -29,6 +29,7 @@ batching, preemption, and tensor parallel are out of scope here.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass
@@ -55,7 +56,10 @@ from phyai.payload import (
     VisionForwardBatch,
 )
 from phyai.runtime.schedule import Scheduler
+from phyai.utils import all_ranks_log
 from phyai.utils.profile import event_scope
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================ #
 # Batch-layout helpers — pi0.5 specific, only consumed by step() below.        #
@@ -475,7 +479,8 @@ class PI05WS1Scheduler(Scheduler):
 
         The time embedding and AdaRMS modulation tables depend on trainable
         parameters but live outside the model state dict. Same-shape refreshes
-        preserve their existing storage so captured CUDA graphs remain valid.
+        preserve their existing storage, then the trainable expert graph is
+        rebuilt so its executable and attention plan match the new weights.
         """
         num_steps = self.cfg.num_inference_steps
         times = 1.0 + torch.arange(
@@ -492,6 +497,12 @@ class PI05WS1Scheduler(Scheduler):
             dt=-1.0 / num_steps,
             num_steps=num_steps,
         )
+        if self.expert_runner.recapture_after_weight_update():
+            all_ranks_log(
+                logger,
+                logging.INFO,
+                "Recaptured PI05 expert CUDA graph after hot weight update.",
+            )
 
     # ------------------------------------------------------------------ #
     # Step (one inference)                                               #
