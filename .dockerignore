@@ -117,9 +117,8 @@ Thumbs.db
 # Claude / agents
 .claude/
 
-# Repo-local docs & examples (not needed at runtime)
+# Repo-local docs and scripts (not needed at runtime)
 docs/
-examples/
 scripts/
 
 # Pre-commit / linting configs
