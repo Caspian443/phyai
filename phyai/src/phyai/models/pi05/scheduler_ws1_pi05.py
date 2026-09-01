@@ -29,139 +29,44 @@ batching, preemption, and tensor parallel are out of scope here.
 
 from __future__ import annotations
 
-import logging
 import math
 import random
-from dataclasses import dataclass
 from typing import Literal
+from dataclasses import dataclass
 
 import torch
 
 from phyai.cache import KVCachePool, StaticCache
-from phyai.layers.attention import (
-    ARAttnMetadata,
-    AttnLayout,
-    AttnMode,
-    DiffusionAttnMetadata,
-)
-from phyai.models.pi05.configuration_pi05 import PI05Config
-from phyai.models.pi05.model_runner_pi05 import (
-    PI05ExpertRunner,
-    PI05LLMRunner,
-    PI05VisionRunner,
-)
-from phyai.models.pi05.modeling_pi05 import PI05Model, value_from_prefix
+from phyai.utils import get_logger
 from phyai.payload import (
     LLMForwardBatch,
     VisionForwardBatch,
 )
-from phyai.runtime.schedule import Scheduler
-from phyai.utils import all_ranks_log
 from phyai.utils.profile import event_scope
+from phyai.layers.attention import (
+    AttnMode,
+    AttnLayout,
+    PagedAttnMetadata,
+)
+from phyai.runtime.schedule import Scheduler
+from phyai.models.pi05.modeling_pi05 import PI05Model, value_from_prefix
+from phyai.models.pi05.model_runner_pi05 import (
+    PI05LLMRunner,
+    PI05ExpertRunner,
+    PI05VisionRunner,
+)
+from phyai.layers.attention.paged.indices import (
+    suffix_pos_ids,
+    visibility_indices,
+    padded_write_indices,
+)
+from phyai.models.pi05.configuration_pi05 import PI05Config
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ============================================================================ #
 # Batch-layout helpers — pi0.5 specific, only consumed by step() below.        #
 # ============================================================================ #
-
-
-def build_prefix_padded_write_indices(
-    real_lens: torch.Tensor,
-    *,
-    n_per_sample: int,
-    prefix_slot_base: int,
-    sentinel_slot: int = 0,
-) -> torch.Tensor:
-    """KV-pool slot index per padded prefix token, ``(B * n_per_sample,)`` int64.
-
-    Real token ``b * n_per_sample + j`` (with ``j < real_lens[b]``) writes
-    to ``prefix_slot_base + cu_real[b] + j``. Padding rows write to
-    ``sentinel_slot`` (typically 0). Directly consumable by
-    :meth:`KVCachePool.write_kv`.
-
-    The same ``j < real_lens[b]`` mask handles inter-sample padding too:
-    setting ``real_lens[b] = 0`` for unused samples routes every one of
-    their ``n_per_sample`` rows to the sentinel slot.
-    """
-    device = real_lens.device
-    B = int(real_lens.shape[0])
-    real64 = real_lens.to(torch.int64)
-    cu_real = torch.zeros(B + 1, dtype=torch.int64, device=device)
-    cu_real[1:] = torch.cumsum(real64, 0)
-
-    j = torch.arange(n_per_sample, dtype=torch.int64, device=device).unsqueeze(0)
-    real_at_b = real64.unsqueeze(1)
-    cu_at_b = cu_real[:-1].unsqueeze(1)
-    is_real = j < real_at_b
-    real_slot = prefix_slot_base + cu_at_b + j
-    write = torch.where(
-        is_real, real_slot, torch.full_like(real_slot, int(sentinel_slot))
-    )
-    return write.flatten().to(torch.int64)
-
-
-def build_suffix_pos_ids(real_lens: torch.Tensor, chunk_size: int) -> torch.Tensor:
-    """RoPE positions for suffix tokens, ``(B * chunk_size,)`` int32.
-
-    Sample ``b``'s chunk sits at positions
-    ``[real_len_b, real_len_b + 1, ..., real_len_b + chunk_size - 1]``
-    so the joint attention K layout (cached prefix + fresh suffix) sees
-    one coherent ``[0..real_len_b + chunk_size - 1]`` per sample.
-    Padded samples (``real_len_b == 0``) get positions ``[0, chunk_size)``
-    — fine because they self-attend only over their own chunk.
-    """
-    device = real_lens.device
-    base = real_lens.to(torch.int64).unsqueeze(1)
-    j = torch.arange(chunk_size, dtype=torch.int64, device=device).unsqueeze(0)
-    return (base + j).flatten().to(torch.int32)
-
-
-def build_joint_paged_kv_indices(
-    real_lens: torch.Tensor,
-    chunk_size: int,
-    *,
-    prefix_slot_base: int,
-    suffix_slot_base: int,
-    n_full: int | None = None,
-) -> torch.Tensor:
-    """Per-sample interleaved slot list for the joint-attention wrapper.
-
-    Output layout per sample:
-    ``[prefix_b0_slots (real_len_0), suffix_b0_slots (chunk_size),
-       prefix_b1_slots (real_len_1), suffix_b1_slots (chunk_size), ...]``
-    concatenated end-to-end, returned as ``(N_full,)`` int32 where
-    ``N_full = sum(real_lens) + B * chunk_size``.
-
-    Padded samples (``real_len_b == 0``) contribute only their suffix
-    slots — the expert step for those rows self-attends within its own
-    chunk, with no real-prefix participation.
-
-    ``n_full`` may be supplied (``sum(real_lens) + B * chunk_size``) when
-    the caller already knows it on the host, to skip the blocking
-    ``int(cu_full[-1])`` device→host read.
-    """
-    device = real_lens.device
-    B = int(real_lens.shape[0])
-    real64 = real_lens.to(torch.int64)
-
-    cu_p = torch.zeros(B + 1, dtype=torch.int64, device=device)
-    cu_p[1:] = torch.cumsum(real64, 0)
-    full_lens = real64 + chunk_size
-    cu_full = torch.zeros(B + 1, dtype=torch.int64, device=device)
-    cu_full[1:] = torch.cumsum(full_lens, 0)
-    if n_full is None:
-        n_full = int(cu_full[-1])
-
-    arange_full = torch.arange(n_full, dtype=torch.int64, device=device)
-    seg_id = torch.searchsorted(cu_full[1:], arange_full, right=True)
-    pos_within = arange_full - cu_full[seg_id]
-    real_at_seg = real64[seg_id]
-    is_prefix = pos_within < real_at_seg
-
-    prefix_slot = prefix_slot_base + cu_p[seg_id] + pos_within
-    suffix_slot = suffix_slot_base + seg_id * chunk_size + (pos_within - real_at_seg)
-    return torch.where(is_prefix, prefix_slot, suffix_slot).to(torch.int32)
 
 
 @dataclass
@@ -272,8 +177,8 @@ class _PI05Layout:
     write_indices: torch.Tensor
     lang_mask: torch.Tensor
     prefix_mask: torch.Tensor
-    prefix_meta: ARAttnMetadata
-    joint_meta: DiffusionAttnMetadata
+    prefix_meta: PagedAttnMetadata
+    joint_meta: PagedAttnMetadata
 
 
 @dataclass
@@ -302,6 +207,8 @@ class PI05WS1Scheduler(Scheduler):
             device = next(model.parameters()).device
         self.device = torch.device(device)
         self.params_dtype = model.params_dtype
+        self.vision_input_dtype = torch.float32
+        self.sampler_dtype = torch.float32
         self.cfg = cfg
         self.max_batch_size = int(max_batch_size)
         if self.max_batch_size <= 0:
@@ -367,7 +274,7 @@ class PI05WS1Scheduler(Scheduler):
         self.vision_runner = PI05VisionRunner(
             model.vision,
             num_images=self.num_images,
-            params_dtype=self.params_dtype,
+            params_dtype=self.vision_input_dtype,
             device=self.device,
             use_cuda_graph=use_cuda_graph,
         )
@@ -498,11 +405,7 @@ class PI05WS1Scheduler(Scheduler):
             num_steps=num_steps,
         )
         if self.expert_runner.recapture_after_weight_update():
-            all_ranks_log(
-                logger,
-                logging.INFO,
-                "Recaptured PI05 expert CUDA graph after hot weight update.",
-            )
+            logger.info("Recaptured PI05 expert CUDA graph after hot weight update.")
 
     # ------------------------------------------------------------------ #
     # Step (one inference)                                               #
@@ -543,9 +446,12 @@ class PI05WS1Scheduler(Scheduler):
         # are written into the packed prefix at sentinel-routed rows,
         # so the values don't propagate anywhere). ``pixel_values`` is the
         # caller's canonical, already-resized tensor; we only move it to the
-        # model device/dtype here (no resize — phyai is strict).
+        # model device and reference stem dtype here (no resize — phyai is
+        # strict).
         with event_scope("pi05.vision_loop"):
-            pixel_values = request.pixel_values.to(device=device, dtype=dtype)
+            pixel_values = request.pixel_values.to(
+                device=device, dtype=self.vision_input_dtype
+            )
             image_embs: torch.Tensor | None = None
             for b in range(actual_B):
                 vision_out = self.vision_runner.forward(
@@ -640,7 +546,6 @@ class PI05WS1Scheduler(Scheduler):
         """Run deterministic inference and return the full model action chunk."""
         cfg = self.cfg
         device = self.device
-        dtype = self.params_dtype
         prepared = self._prepare_prefix(request)
         actual_B = prepared.actual_batch_size
         max_B = self.max_batch_size
@@ -656,7 +561,7 @@ class PI05WS1Scheduler(Scheduler):
                     max_B,
                     cfg.chunk_size,
                     cfg.max_action_dim,
-                    dtype=dtype,
+                    dtype=self.sampler_dtype,
                     device=device,
                 )
             else:
@@ -664,10 +569,12 @@ class PI05WS1Scheduler(Scheduler):
                     max_B,
                     cfg.chunk_size,
                     cfg.max_action_dim,
-                    dtype=dtype,
+                    dtype=self.sampler_dtype,
                     device=device,
                 )
-                noise[:actual_B] = request.noise.to(device=device, dtype=dtype)
+                noise[:actual_B] = request.noise.to(
+                    device=device, dtype=self.sampler_dtype
+                )
             x_t = self.expert_runner.forward(noise)
         # ``x_t`` aliases the captured graph's static output buffer — clone
         # it (and drop the padded tail) so the result survives the next step.
@@ -970,16 +877,16 @@ class PI05WS1Scheduler(Scheduler):
             device=device,
         )
         paged_kv_last_prefix = (real_lens > 0).to(torch.int32)
-        write_indices = build_prefix_padded_write_indices(
+        write_indices = padded_write_indices(
             real_lens,
             n_per_sample=n_ps,
-            prefix_slot_base=self.prefix_base,
+            slot_base=self.prefix_base,
             sentinel_slot=self.sentinel_slot,
         )
         position_ids = torch.arange(n_ps, dtype=torch.int32, device=device).repeat(
             max_B
         )
-        prefix_meta = ARAttnMetadata(
+        prefix_meta = PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=max_B,
@@ -993,24 +900,27 @@ class PI05WS1Scheduler(Scheduler):
         )
 
         # --- Joint (expert) attention layout ---
-        pos_ids_suffix = build_suffix_pos_ids(real_lens, chunk)
+        pos_ids_suffix = suffix_pos_ids(real_lens, chunk)
         cu_q_suffix = torch.arange(
             0, (max_B + 1) * chunk, chunk, dtype=torch.int32, device=device
         )
         paged_kv_indptr_full = torch.zeros(max_B + 1, dtype=torch.int32, device=device)
         paged_kv_indptr_full[1:] = torch.cumsum(real_lens + chunk, 0)
         # Host-side total joint length — passing it skips the blocking
-        # ``int(cu_full[-1])`` read inside build_joint_paged_kv_indices.
+        # ``int(cu_full[-1])`` read inside visibility_indices.
         n_full = n_real_total + max_B * chunk
-        paged_kv_indices_full = build_joint_paged_kv_indices(
+        # The expert's joint pass sees each sample's real prefix plus its
+        # own whole chunk (visibility == stride).
+        paged_kv_indices_full = visibility_indices(
             real_lens,
-            chunk,
             prefix_slot_base=self.prefix_base,
             suffix_slot_base=self.suffix_base,
+            suffix_stride=chunk,
+            suffix_visible=chunk,
             n_full=n_full,
         )
         paged_kv_last_full = torch.ones(max_B, dtype=torch.int32, device=device)
-        joint_meta = DiffusionAttnMetadata(
+        joint_meta = PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=max_B,

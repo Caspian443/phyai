@@ -22,13 +22,8 @@ from phyai.weights import loader as loader_mod
 from phyai.weights.loader import WeightLoadSession
 
 
-def _init_dispatcher():
-    return L.init(register_flashinfer=False, validate=False)
-
-
 def test_load_replicated_linear_end_to_end(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=4,
         out_features=8,
@@ -49,8 +44,8 @@ def test_load_replicated_linear_end_to_end(tmp_path: Path, fake_mesh):
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
     assert not report.missing
     assert not report.unexpected
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
+    torch.testing.assert_close(layer.weight.data.cpu(), src_w)
+    torch.testing.assert_close(layer.bias.data.cpu(), src_b)
 
 
 def test_weight_load_session_applies_streamed_tensors(fake_mesh):
@@ -98,7 +93,6 @@ def test_weight_load_session_strict_missing(fake_mesh):
 
 def test_load_qkv_fused(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.QKVParallelLinear(
         hidden_size=8,
         head_dim=4,
@@ -135,12 +129,11 @@ def test_load_norm(tmp_path: Path, fake_mesh):
     save_file({"ln.weight": src}, str(tmp_path / "ln.safetensors"))
     report = load_pretrained(norm, [tmp_path / "ln.safetensors"])
     assert report.loaded == ["ln.weight"]
-    torch.testing.assert_close(norm.weight.data, src)
+    torch.testing.assert_close(norm.weight.data.cpu(), src)
 
 
 def test_load_strict_missing_raises(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=2,
         out_features=2,
@@ -159,7 +152,6 @@ def test_load_strict_missing_raises(tmp_path: Path, fake_mesh):
 
 def test_load_strict_missing_non_strict_returns_report(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=2,
         out_features=2,
@@ -177,7 +169,6 @@ def test_load_strict_missing_non_strict_returns_report(tmp_path: Path, fake_mesh
 
 def test_unexpected_key_recorded(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=2,
         out_features=2,
@@ -196,7 +187,6 @@ def test_unexpected_key_recorded(tmp_path: Path, fake_mesh):
 
 def test_remap_callable_rewrites_keys(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=2,
         out_features=2,
@@ -216,12 +206,11 @@ def test_remap_callable_rewrites_keys(tmp_path: Path, fake_mesh):
         remap=lambda k: k.replace("transformer.", "model."),
     )
     assert report.loaded == ["model.fc.weight"]
-    torch.testing.assert_close(layer.weight.data, src)
+    torch.testing.assert_close(layer.weight.data.cpu(), src)
 
 
 def test_remap_dict_substring_rewrites(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=2,
         out_features=2,
@@ -241,7 +230,6 @@ def test_remap_dict_substring_rewrites(tmp_path: Path, fake_mesh):
 
 def test_remap_returns_none_drops_key(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=2,
         out_features=2,
@@ -265,7 +253,6 @@ def test_remap_returns_none_drops_key(tmp_path: Path, fake_mesh):
 
 def test_dtype_cast_recorded(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = L.ReplicatedLinear(
         in_features=2,
         out_features=2,
@@ -357,7 +344,6 @@ def _make_replicated(prefix: str = "mod.fc") -> "L.ReplicatedLinear":
 def test_load_from_folder_single_safetensors(tmp_path: Path, fake_mesh):
     """source = checkpoint folder containing model.safetensors."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -367,14 +353,13 @@ def test_load_from_folder_single_safetensors(tmp_path: Path, fake_mesh):
     )
     report = load_pretrained(layer, tmp_path)
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
+    torch.testing.assert_close(layer.weight.data.cpu(), src_w)
+    torch.testing.assert_close(layer.bias.data.cpu(), src_b)
 
 
 def test_load_from_folder_str_path(tmp_path: Path, fake_mesh):
     """source = str path to a folder."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -389,7 +374,6 @@ def test_load_from_folder_str_path(tmp_path: Path, fake_mesh):
 def test_load_from_folder_with_index(tmp_path: Path, fake_mesh):
     """source = folder using model.safetensors.index.json across two shards."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -414,14 +398,13 @@ def test_load_from_folder_with_index(tmp_path: Path, fake_mesh):
     )
     report = load_pretrained(layer, tmp_path)
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
+    torch.testing.assert_close(layer.weight.data.cpu(), src_w)
+    torch.testing.assert_close(layer.bias.data.cpu(), src_b)
 
 
 def test_load_from_single_file_path(tmp_path: Path, fake_mesh):
     """source = a single file path (str or Path), not a folder."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -449,7 +432,6 @@ def test_load_from_pytorch_checkpoint(
     """PyTorch formats use the same dispatch and report as safetensors."""
 
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -465,8 +447,8 @@ def test_load_from_pytorch_checkpoint(
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
     assert not report.missing
     assert not report.unexpected
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
+    torch.testing.assert_close(layer.weight.data.cpu(), src_w)
+    torch.testing.assert_close(layer.bias.data.cpu(), src_b)
 
 
 @pytest.mark.parametrize(
@@ -479,7 +461,6 @@ def test_checkpoint_format(suffix: str, expected: str):
 
 def test_load_from_pytorch_checkpoint_folder(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -491,13 +472,12 @@ def test_load_from_pytorch_checkpoint_folder(tmp_path: Path, fake_mesh):
     report = load_pretrained(layer, tmp_path)
 
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
+    torch.testing.assert_close(layer.weight.data.cpu(), src_w)
+    torch.testing.assert_close(layer.bias.data.cpu(), src_b)
 
 
 def test_load_legacy_pytorch_serialization(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -510,14 +490,13 @@ def test_load_legacy_pytorch_serialization(tmp_path: Path, fake_mesh):
     report = load_pretrained(layer, tmp_path / "legacy.pth")
 
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
-    torch.testing.assert_close(layer.weight.data, src_w)
-    torch.testing.assert_close(layer.bias.data, src_b)
+    torch.testing.assert_close(layer.weight.data.cpu(), src_w)
+    torch.testing.assert_close(layer.bias.data.cpu(), src_b)
 
 
 def test_load_from_iterable_of_str(tmp_path: Path, fake_mesh):
     """source = iterable of str (existing-iterable contract preserved)."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -532,7 +511,6 @@ def test_load_from_iterable_of_str(tmp_path: Path, fake_mesh):
 def test_load_from_empty_folder_raises(tmp_path: Path, fake_mesh):
     """A folder without supported model weights fails before loading."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     with pytest.raises(FileNotFoundError, match="no supported model weight files"):
         load_pretrained(layer, tmp_path)
@@ -540,7 +518,6 @@ def test_load_from_empty_folder_raises(tmp_path: Path, fake_mesh):
 
 def test_duplicate_key_after_remap_raises(tmp_path: Path, fake_mesh):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     first = tmp_path / "first.safetensors"
     second = tmp_path / "second.safetensors"
@@ -564,7 +541,6 @@ def test_load_unexpected_keys_with_dropping_remap_via_folder(tmp_path: Path, fak
     land in.
     """
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -591,7 +567,6 @@ def test_safetensors_dispatches_keys_before_materializing_tensors(
     monkeypatch,
 ):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"placeholder")
@@ -710,7 +685,6 @@ def test_progress_disable_resolution(fake_mesh):
 def test_progress_bar_advances_once_per_key(tmp_path: Path, fake_mesh, spy_bar):
     """Bar total == key count and it ticks for every key, dropped ones included."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -742,7 +716,6 @@ def test_progress_bar_advances_once_per_key(tmp_path: Path, fake_mesh, spy_bar):
 
 def test_progress_false_disables_bar(tmp_path: Path, fake_mesh, spy_bar):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     save_file(
         {"mod.fc.weight": torch.randn(8, 4), "mod.fc.bias": torch.randn(8)},
@@ -758,7 +731,6 @@ def test_progress_false_disables_bar(tmp_path: Path, fake_mesh, spy_bar):
 def test_progress_default_is_auto(tmp_path: Path, fake_mesh, spy_bar):
     """Default (no progress kwarg) defers to tqdm's own TTY detection."""
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     save_file(
         {"mod.fc.weight": torch.randn(8, 4), "mod.fc.bias": torch.randn(8)},
@@ -775,7 +747,6 @@ def test_pytorch_progress_counts_files_and_loads_each_once(
     monkeypatch,
 ):
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     weight_path = tmp_path / "weight.bin"
     bias_path = tmp_path / "bias.bin"
@@ -860,7 +831,6 @@ def test_load_pretrained_repo_id_forwarded(tmp_path: Path, fake_mesh, monkeypatc
     find_safetensors. No network: snapshot_download is monkeypatched.
     """
     fake_mesh(sizes={"tp": 1})
-    _init_dispatcher()
     layer = _make_replicated()
     src_w = torch.randn(8, 4, dtype=torch.float32)
     src_b = torch.randn(8, dtype=torch.float32)
@@ -881,4 +851,4 @@ def test_load_pretrained_repo_id_forwarded(tmp_path: Path, fake_mesh, monkeypatc
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
     assert seen["repo_id"] == "org/model"
     assert seen["revision"] == "v1"
-    torch.testing.assert_close(layer.weight.data, src_w)
+    torch.testing.assert_close(layer.weight.data.cpu(), src_w)
