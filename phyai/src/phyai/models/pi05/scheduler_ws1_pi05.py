@@ -774,8 +774,22 @@ class PI05WS1Scheduler(Scheduler):
         if request.noise_method == "flow_ode" or request.noise_level == 0:
             return sigmas
 
-        timesteps = torch.linspace(1.0, 1.0 / num_steps, num_steps, device=self.device)
-        timesteps = torch.cat([timesteps, torch.zeros(1, device=self.device)])
+        # Engine initialization pins the process default dtype to the parameter
+        # dtype (normally bf16). Sampling schedules feed probability math and
+        # must remain fp32 to match RLinf's actor-side recomputation.
+        timesteps = torch.linspace(
+            1.0,
+            1.0 / num_steps,
+            num_steps,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        timesteps = torch.cat(
+            [
+                timesteps,
+                torch.zeros(1, dtype=torch.float32, device=self.device),
+            ]
+        )
         denominator = torch.where(timesteps == 1, timesteps[1], timesteps)
         schedule = (
             request.noise_level * torch.sqrt(timesteps / (1.0 - denominator))[:-1]

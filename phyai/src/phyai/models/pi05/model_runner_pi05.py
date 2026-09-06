@@ -593,7 +593,14 @@ class PI05ExpertRunner(ModelRunner):
             device=time_emb_table.device,
         )
         self._timesteps = torch.cat(
-            [self._timesteps, torch.zeros(1, device=time_emb_table.device)]
+            [
+                self._timesteps,
+                torch.zeros(
+                    1,
+                    dtype=torch.float32,
+                    device=time_emb_table.device,
+                ),
+            ]
         )
         self._dt = float(dt)
         self._num_steps = int(num_steps)
