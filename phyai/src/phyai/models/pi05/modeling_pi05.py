@@ -985,8 +985,11 @@ class _ValueLinear(ReplicatedLinear):
 class PI05ValueHead(nn.Module):
     """RLinf-compatible MLP critic over pooled pi0.5 hidden features.
 
-    Value inference stays in fp32. The sequential indices intentionally match
-    RLinf's checkpoint keys: ``value_head.mlp.{0,2,4,6}.{weight,bias}``.
+    Parameters and MLP compute follow the enclosing model dtype, matching
+    RLinf's ``openpi_rlinf`` value head. Public value outputs are still promoted
+    to fp32 by :func:`value_from_prefix` and :func:`value_from_suffix`. The
+    sequential indices intentionally match RLinf's checkpoint keys:
+    ``value_head.mlp.{0,2,4,6}.{weight,bias}``.
     """
 
     def __init__(
@@ -994,9 +997,11 @@ class PI05ValueHead(nn.Module):
         input_dim: int,
         hidden_sizes: tuple[int, ...],
         *,
+        params_dtype: torch.dtype = torch.float32,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
+        self.params_dtype = params_dtype
         widths = (input_dim, *hidden_sizes, 1)
         layers: list[nn.Module] = []
         for index, (in_features, out_features) in enumerate(pairwise(widths)):
@@ -1005,7 +1010,7 @@ class PI05ValueHead(nn.Module):
                 in_features=in_features,
                 out_features=out_features,
                 bias=True,
-                params_dtype=torch.float32,
+                params_dtype=params_dtype,
                 spec=Bf16Spec(),
                 device=device,
                 prefix=f"value_head.mlp.{linear_index}",
@@ -1039,7 +1044,7 @@ class PI05ValueHead(nn.Module):
                 module.bias.optional = True
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.mlp(features.to(torch.float32))
+        return self.mlp(features.to(self.params_dtype))
 
 
 def value_from_prefix(
@@ -1053,8 +1058,8 @@ def value_from_prefix(
 
     This matches RLinf's pi0.5 ``mean_token`` path: only valid image and
     language positions participate in the mean. ``prefix_out`` is kept in its
-    model dtype during pooling, then :class:`PI05ValueHead` promotes the pooled
-    features to fp32.
+    model dtype during pooling and value-head compute; only the returned values
+    are promoted to fp32.
     """
     if mode != "mean_token":
         raise NotImplementedError(
@@ -1221,6 +1226,7 @@ class PI05Model(nn.Module):
             PI05ValueHead(
                 config.value_head_input_dim,
                 config.value_head_hidden_sizes,
+                params_dtype=params_dtype,
                 device=device,
             )
             if config.add_value_head
