@@ -20,6 +20,7 @@ explicitly when overriding from defaults.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from phyai.models.configuration import PretrainedConfig
 
@@ -190,6 +191,17 @@ class PI05Config(PretrainedConfig):
     max_period: float = 4.0
     tokenizer_max_length: int = 200
 
+    # RL critic. ``value_after_vlm`` selects the prefix or suffix residual
+    # stream. ``action_chunk`` only affects suffix pooling when
+    # ``chunk_critic_input=True``; ``None`` means the full action horizon.
+    action_chunk: int | None = None
+    detach_critic_input: bool = False
+    chunk_critic_input: bool = False
+    add_value_head: bool = False
+    value_after_vlm: bool = False
+    value_vlm_mode: Literal["mean_token"] = "mean_token"
+    value_head_hidden_sizes: tuple[int, ...] = (512, 256, 128)
+
     def __post_init__(self) -> None:
         if self.vision.projection_dim != self.text.hidden_size:
             raise ValueError(
@@ -226,11 +238,41 @@ class PI05Config(PretrainedConfig):
             raise ValueError(
                 f"num_inference_steps must be positive, got {self.num_inference_steps}."
             )
+        if (
+            self.action_chunk is not None
+            and not 1 <= self.action_chunk <= self.chunk_size
+        ):
+            raise ValueError(
+                f"action_chunk must be in [1, {self.chunk_size}], got "
+                f"{self.action_chunk}."
+            )
+        if self.value_vlm_mode != "mean_token":
+            raise ValueError(
+                f"value_vlm_mode must be 'mean_token', got {self.value_vlm_mode!r}."
+            )
+        if not self.value_head_hidden_sizes or any(
+            width <= 0 for width in self.value_head_hidden_sizes
+        ):
+            raise ValueError(
+                "value_head_hidden_sizes must contain positive layer widths."
+            )
 
     @property
     def num_layers(self) -> int:
         """Layer count for the joint stack — text and expert share it."""
         return self.text.num_hidden_layers
+
+    @property
+    def critic_action_chunk(self) -> int:
+        """Number of suffix tokens used by chunk-restricted critic pooling."""
+        return self.action_chunk if self.action_chunk is not None else self.chunk_size
+
+    @property
+    def value_head_input_dim(self) -> int:
+        """Residual-stream width consumed by the configured critic."""
+        if self.value_after_vlm:
+            return self.text.hidden_size
+        return self.expert.hidden_size
 
 
 __all__ = [
